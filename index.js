@@ -10,9 +10,20 @@ const app = express();
 const allowedOrigins = [
   "https://meet.quantumlogicslimited.com",
   "https://www.meet.quantumlogicslimited.com",
+  "https://quantum-meet-frontend.vercel.app",
   "http://localhost:3000",
   "http://localhost:5001",
+  // Extra origins (e.g. a custom domain) can be added without a redeploy.
+  ...(process.env.EXTRA_ALLOWED_ORIGINS || "")
+    .split(",")
+    .map((o) => o.trim())
+    .filter(Boolean),
 ];
+
+// Vercel gives every preview/branch deploy its own subdomain
+// (quantum-meet-frontend-<hash>-<team>.vercel.app) — match those too so
+// preview deployments aren't blocked by CORS.
+const allowedOriginPattern = /^https:\/\/quantum-meet-frontend(-[a-z0-9-]+)?\.vercel\.app$/;
 
 // ── Security headers ──────────────────────────────────────────────────────────
 app.use(
@@ -24,7 +35,11 @@ app.use(
 app.use(
   cors({
     origin: (origin, callback) => {
-      if (!origin || allowedOrigins.includes(origin)) {
+      if (
+        !origin ||
+        allowedOrigins.includes(origin) ||
+        allowedOriginPattern.test(origin)
+      ) {
         callback(null, true);
       } else {
         callback(new Error("CORS: origin not allowed → " + origin));
