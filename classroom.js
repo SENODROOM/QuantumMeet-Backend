@@ -1,7 +1,7 @@
 const express = require("express");
-const multer = require("multer");
-const path = require("path");
-const fs = require("fs");
+const { Readable } = require("stream");
+const { handleUpload } = require("@vercel/blob/client");
+const { del } = require("@vercel/blob");
 const mongoose = require("mongoose");
 const { v4: uuidv4 } = require("uuid");
 
@@ -15,23 +15,11 @@ const router = express.Router();
 // Meeting rooms stay login-free. Only the classroom surface is protected.
 router.use(auth);
 
-// ── Upload dir ────────────────────────────────────────────────────────────────
-const UPLOAD_DIR = path.join(__dirname, "uploads");
-if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const d = path.join(UPLOAD_DIR, req.params.classroomId || "general");
-    if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
-    cb(null, d);
-  },
-  filename: (req, file, cb) => {
-    const safe = file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_");
-    cb(null, `${Date.now()}_${uuidv4().slice(0, 6)}_${safe}`);
-  },
-});
-
-// FIX: reduced from 500MB to 50MB, added file type whitelist
+// ── Uploads ───────────────────────────────────────────────────────────────────
+// Files never pass through this server: the client uploads straight to Vercel
+// Blob (client-upload flow) since serverless functions cap request bodies at
+// ~4.5MB, far under the 50MB limit this app allows. This route only issues the
+// signed, scoped upload token — see POST /:classroomId/blob-upload below.
 const ALLOWED_MIME_TYPES = new Set([
   "image/jpeg",
   "image/png",
@@ -52,30 +40,26 @@ const ALLOWED_MIME_TYPES = new Set([
   "text/plain",
 ]);
 
-const upload = multer({
-  storage,
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB
-  fileFilter: (req, file, cb) => {
-    if (ALLOWED_MIME_TYPES.has(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error(`File type not allowed: ${file.mimetype}`));
-    }
-  },
-});
-
-// Multer error handler — must be applied per-route after upload middleware
-const handleUploadError = (err, req, res, next) => {
-  if (err instanceof multer.MulterError) {
-    if (err.code === "LIMIT_FILE_SIZE")
-      return res
-        .status(400)
-        .json({ error: "File too large. Maximum size is 50 MB." });
-    return res.status(400).json({ error: err.message });
+router.post("/:classroomId/blob-upload", async (req, res) => {
+  try {
+    const { classroomId } = req.params;
+    const userId = req.user.id;
+    const jsonResponse = await handleUpload({
+      body: req.body,
+      request: req,
+      onBeforeGenerateToken: async () => ({
+        allowedContentTypes: [...ALLOWED_MIME_TYPES],
+        maximumSizeInBytes: 50 * 1024 * 1024,
+        addRandomSuffix: true,
+        tokenPayload: JSON.stringify({ classroomId, userId }),
+      }),
+      onUploadCompleted: async () => {},
+    });
+    res.json(jsonResponse);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
   }
-  if (err) return res.status(400).json({ error: err.message });
-  next();
-};
+});
 
 // ── Schemas ───────────────────────────────────────────────────────────────────
 const classroomSchema = new mongoose.Schema({
@@ -120,7 +104,9 @@ const postSchema = new mongoose.Schema({
   body: { type: String, default: "" },
   authorId: { type: String, required: true },
   authorName: { type: String, required: true },
-  attachments: [{ name: String, filename: String, size: Number, mime: String }],
+  attachments: [
+    { name: String, url: String, pathname: String, size: Number, mime: String },
+  ],
   dueDate: { type: Date },
   points: { type: Number },
   topic: { type: String, default: "" },
@@ -146,7 +132,9 @@ const submissionSchema = new mongoose.Schema({
   studentId: { type: String, required: true },
   studentName: { type: String, required: true },
   comment: { type: String, default: "" },
-  attachments: [{ name: String, filename: String, size: Number, mime: String }],
+  attachments: [
+    { name: String, url: String, pathname: String, size: Number, mime: String },
+  ],
   grade: { type: Number },
   feedback: { type: String, default: "" },
   privateNote: { type: String, default: "" },
@@ -520,103 +508,91 @@ router.get("/:classroomId/posts", async (req, res) => {
   }
 });
 
-router.post(
-  "/:classroomId/posts",
-  upload.array("files", 20),
-  handleUploadError,
-  async (req, res) => {
-    try {
-      const {
-        type,
-        title,
-        body,
-        dueDate,
-        points,
-        topic,
-        quizQuestions,
-        pollOptions,
-      } = req.body;
-      const attachments = (req.files || []).map((f) => ({
-        name: f.originalname,
-        filename: f.filename,
-        size: f.size,
-        mime: f.mimetype,
-      }));
+// `attachments` arrives as JSON — files were already uploaded client-side to
+// Vercel Blob via the /blob-upload token endpoint before this call is made.
+const parseMaybeJSON = (v) => {
+  if (v == null) return v;
+  if (typeof v !== "string") return v;
+  try {
+    return JSON.parse(v);
+  } catch {
+    return v;
+  }
+};
 
-      // FIX: authorId and authorName from token
-      const data = {
-        postId: mkId(),
+router.post("/:classroomId/posts", async (req, res) => {
+  try {
+    const {
+      type,
+      title,
+      body,
+      dueDate,
+      points,
+      topic,
+      quizQuestions,
+      pollOptions,
+      attachments,
+    } = req.body;
+
+    // FIX: authorId and authorName from token
+    const data = {
+      postId: mkId(),
+      classroomId: req.params.classroomId,
+      type: type || "announcement",
+      title: title || "",
+      body: body || "",
+      authorId: req.user.id,
+      authorName: req.user.name,
+      attachments: parseMaybeJSON(attachments) || [],
+      topic: topic || "",
+      dueDate: dueDate ? new Date(dueDate) : undefined,
+      points: points ? Number(points) : undefined,
+    };
+
+    const parsedQuiz = parseMaybeJSON(quizQuestions);
+    if (parsedQuiz) data.quizQuestions = parsedQuiz;
+
+    const parsedPolls = parseMaybeJSON(pollOptions);
+    if (parsedPolls) {
+      data.pollOptions = parsedPolls.map((t) => ({ text: t, votes: [] }));
+    }
+
+    const doc = await Post.create(data);
+    res.json(doc);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.patch("/:classroomId/posts/:postId", async (req, res) => {
+  try {
+    const { title, body, dueDate, points, topic, attachments } = req.body;
+    const doc = await Post.findOne({ postId: req.params.postId });
+    if (!doc) return res.status(404).json({ error: "Not found" });
+    // Only the author or classroom creator can edit
+    if (doc.authorId !== req.user.id) {
+      const classroom = await Classroom.findOne({
         classroomId: req.params.classroomId,
-        type: type || "announcement",
-        title: title || "",
-        body: body || "",
-        authorId: req.user.id,
-        authorName: req.user.name,
-        attachments,
-        topic: topic || "",
-        dueDate: dueDate ? new Date(dueDate) : undefined,
-        points: points ? Number(points) : undefined,
-      };
-
-      if (quizQuestions) {
-        try {
-          data.quizQuestions = JSON.parse(quizQuestions);
-        } catch {}
-      }
-      if (pollOptions) {
-        try {
-          const opts = JSON.parse(pollOptions);
-          data.pollOptions = opts.map((t) => ({ text: t, votes: [] }));
-        } catch {}
-      }
-
-      const doc = await Post.create(data);
-      res.json(doc);
-    } catch (e) {
-      res.status(500).json({ error: e.message });
+      });
+      if (!classroom || classroom.creatorId !== req.user.id)
+        return res.status(403).json({ error: "Not authorized" });
     }
-  },
-);
-
-router.patch(
-  "/:classroomId/posts/:postId",
-  upload.array("files", 20),
-  handleUploadError,
-  async (req, res) => {
-    try {
-      const { title, body, dueDate, points, topic } = req.body;
-      const doc = await Post.findOne({ postId: req.params.postId });
-      if (!doc) return res.status(404).json({ error: "Not found" });
-      // Only the author or classroom creator can edit
-      if (doc.authorId !== req.user.id) {
-        const classroom = await Classroom.findOne({
-          classroomId: req.params.classroomId,
-        });
-        if (!classroom || classroom.creatorId !== req.user.id)
-          return res.status(403).json({ error: "Not authorized" });
-      }
-      if (title !== undefined) doc.title = title;
-      if (body !== undefined) doc.body = body;
-      if (topic !== undefined) doc.topic = topic;
-      if (dueDate !== undefined)
-        doc.dueDate = dueDate ? new Date(dueDate) : null;
-      if (points !== undefined) doc.points = points ? Number(points) : null;
-      if (req.files?.length) {
-        const newAtts = req.files.map((f) => ({
-          name: f.originalname,
-          filename: f.filename,
-          size: f.size,
-          mime: f.mimetype,
-        }));
-        doc.attachments = [...(doc.attachments || []), ...newAtts];
-      }
-      await doc.save();
-      res.json(doc);
-    } catch (e) {
-      res.status(500).json({ error: e.message });
+    if (title !== undefined) doc.title = title;
+    if (body !== undefined) doc.body = body;
+    if (topic !== undefined) doc.topic = topic;
+    if (dueDate !== undefined)
+      doc.dueDate = dueDate ? new Date(dueDate) : null;
+    if (points !== undefined) doc.points = points ? Number(points) : null;
+    const newAtts = parseMaybeJSON(attachments);
+    if (newAtts?.length) {
+      doc.attachments = [...(doc.attachments || []), ...newAtts];
     }
-  },
-);
+    await doc.save();
+    res.json(doc);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 router.patch("/:classroomId/posts/:postId/pin", async (req, res) => {
   try {
@@ -646,10 +622,9 @@ router.delete("/:classroomId/posts/:postId", async (req, res) => {
       if (!classroom || classroom.creatorId !== req.user.id)
         return res.status(403).json({ error: "Not authorized" });
     }
-    doc.attachments.forEach((a) => {
-      const fp = path.join(UPLOAD_DIR, req.params.classroomId, a.filename);
-      if (fs.existsSync(fp)) fs.unlinkSync(fp);
-    });
+    await Promise.all(
+      doc.attachments.map((a) => del(a.url).catch(() => {})),
+    );
     await Post.deleteOne({ postId: req.params.postId });
     await Comment.deleteMany({ postId: req.params.postId });
     await Submission.deleteMany({ postId: req.params.postId });
@@ -803,81 +778,67 @@ router.get("/:classroomId/gradebook", async (req, res) => {
   }
 });
 
-router.post(
-  "/:classroomId/posts/:postId/submissions",
-  upload.array("files", 10),
-  handleUploadError,
-  async (req, res) => {
-    try {
-      const { comment, quizAnswers } = req.body;
-      const attachments = (req.files || []).map((f) => ({
-        name: f.originalname,
-        filename: f.filename,
-        size: f.size,
-        mime: f.mimetype,
-      }));
+router.post("/:classroomId/posts/:postId/submissions", async (req, res) => {
+  try {
+    const { comment, quizAnswers, attachments } = req.body;
+    const parsedAttachments = parseMaybeJSON(attachments) || [];
 
-      // FIX: studentId and studentName from token
-      const studentId = req.user.id;
-      const studentName = req.user.name;
+    // FIX: studentId and studentName from token
+    const studentId = req.user.id;
+    const studentName = req.user.name;
 
-      const old = await Submission.findOne({
-        postId: req.params.postId,
-        studentId,
-      });
-      if (old) {
-        old.attachments.forEach((a) => {
-          const fp = path.join(UPLOAD_DIR, req.params.classroomId, a.filename);
-          if (fs.existsSync(fp)) fs.unlinkSync(fp);
-        });
-        await Submission.deleteOne({ submissionId: old.submissionId });
-      }
-
-      let quizScore;
-      let parsedAnswers;
-      if (quizAnswers) {
-        try {
-          parsedAnswers = JSON.parse(quizAnswers);
-          const post = await Post.findOne({ postId: req.params.postId });
-          if (post?.quizQuestions?.length) {
-            let correct = 0;
-            parsedAnswers.forEach((ans, i) => {
-              if (ans === post.quizQuestions[i]?.correct) correct++;
-            });
-            quizScore = Math.round(
-              (correct / post.quizQuestions.length) * (post.points || 100),
-            );
-          }
-        } catch {}
-      }
-
-      const post = await Post.findOne({ postId: req.params.postId });
-      const isLate = post?.dueDate && new Date() > new Date(post.dueDate);
-
-      const doc = await Submission.create({
-        submissionId: mkId(),
-        postId: req.params.postId,
-        classroomId: req.params.classroomId,
-        studentId,
-        studentName,
-        comment: comment || "",
-        attachments,
-        status: isLate ? "late" : "submitted",
-        quizAnswers: parsedAnswers,
-        quizScore,
-        grade: quizScore,
-      });
-      if (quizScore !== undefined) {
-        doc.status = "graded";
-        doc.gradedAt = new Date();
-        await doc.save();
-      }
-      res.json(doc);
-    } catch (e) {
-      res.status(500).json({ error: e.message });
+    const old = await Submission.findOne({
+      postId: req.params.postId,
+      studentId,
+    });
+    if (old) {
+      await Promise.all(
+        old.attachments.map((a) => del(a.url).catch(() => {})),
+      );
+      await Submission.deleteOne({ submissionId: old.submissionId });
     }
-  },
-);
+
+    let quizScore;
+    const parsedAnswers = parseMaybeJSON(quizAnswers);
+    if (parsedAnswers) {
+      const post = await Post.findOne({ postId: req.params.postId });
+      if (post?.quizQuestions?.length) {
+        let correct = 0;
+        parsedAnswers.forEach((ans, i) => {
+          if (ans === post.quizQuestions[i]?.correct) correct++;
+        });
+        quizScore = Math.round(
+          (correct / post.quizQuestions.length) * (post.points || 100),
+        );
+      }
+    }
+
+    const post = await Post.findOne({ postId: req.params.postId });
+    const isLate = post?.dueDate && new Date() > new Date(post.dueDate);
+
+    const doc = await Submission.create({
+      submissionId: mkId(),
+      postId: req.params.postId,
+      classroomId: req.params.classroomId,
+      studentId,
+      studentName,
+      comment: comment || "",
+      attachments: parsedAttachments,
+      status: isLate ? "late" : "submitted",
+      quizAnswers: parsedAnswers,
+      quizScore,
+      grade: quizScore,
+    });
+    if (quizScore !== undefined) {
+      doc.status = "graded";
+      doc.gradedAt = new Date();
+      await doc.save();
+    }
+    res.json(doc);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 router.patch(
   "/:classroomId/posts/:postId/submissions/:submissionId/grade",
@@ -978,13 +939,45 @@ router.patch(
 // FILE DOWNLOAD
 // ═════════════════════════════════════════════════════════════════════════════
 
-router.get("/:classroomId/files/:filename", (req, res) => {
-  // Sanitize filename — prevent path traversal
-  const filename = path.basename(req.params.filename);
-  const fp = path.join(UPLOAD_DIR, req.params.classroomId, filename);
-  if (!fs.existsSync(fp))
-    return res.status(404).json({ error: "File not found" });
-  res.download(fp);
+// Files live in Vercel Blob (public-URL-only storage — no built-in private
+// URLs), so access control is enforced here instead: only proxy a URL that is
+// actually attached to a post/submission in a classroom the caller belongs to.
+router.get("/:classroomId/download", async (req, res) => {
+  try {
+    const { url } = req.query;
+    if (!url) return res.status(400).json({ error: "url required" });
+
+    const classroom = await Classroom.findOne({
+      classroomId: req.params.classroomId,
+    });
+    if (!classroom) return res.status(404).json({ error: "Not found" });
+    const isMember =
+      classroom.members.some((m) => m.userId === req.user.id) ||
+      classroom.creatorId === req.user.id;
+    if (!isMember)
+      return res.status(403).json({ error: "Not a member of this classroom" });
+
+    const [post, submission] = await Promise.all([
+      Post.findOne({ classroomId: req.params.classroomId, "attachments.url": url }),
+      Submission.findOne({
+        classroomId: req.params.classroomId,
+        "attachments.url": url,
+      }),
+    ]);
+    if (!post && !submission)
+      return res.status(404).json({ error: "File not found" });
+
+    const blobRes = await fetch(url);
+    if (!blobRes.ok || !blobRes.body)
+      return res.status(404).json({ error: "File not found" });
+    res.setHeader(
+      "Content-Type",
+      blobRes.headers.get("content-type") || "application/octet-stream",
+    );
+    Readable.fromWeb(blobRes.body).pipe(res);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
