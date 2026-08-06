@@ -384,6 +384,29 @@ router.post("/:roomId/knock", async (req, res) => {
   }
 });
 
+/** Guest cancels their own knock (leave waiting room). */
+router.delete("/:roomId/knock", async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const { userId } = req.body || {};
+    const uid = userId || req.query.userId;
+    if (!uid) return res.status(400).json({ error: "userId required" });
+    await KnockRequest.deleteOne({ roomId, userId: uid });
+    const room = await Room.findOne({ roomId });
+    if (room?.host) {
+      await publish(
+        roomId,
+        "knock-cancelled",
+        { userId: uid, socketId: uid, to: room.host },
+        { to: room.host },
+      );
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 router.get("/:roomId/knocks", async (req, res) => {
   try {
     const { userId } = req.query;

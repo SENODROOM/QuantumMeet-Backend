@@ -110,6 +110,8 @@ const postSchema = new mongoose.Schema({
   dueDate: { type: Date },
   points: { type: Number },
   topic: { type: String, default: "" },
+  /** When false, overdue submissions are rejected (default allows late). */
+  allowLateSubmissions: { type: Boolean, default: true },
   createdAt: { type: Date, default: Date.now },
   pinned: { type: Boolean, default: false },
   quizQuestions: [
@@ -208,11 +210,17 @@ const scheduledPostSchema = new mongoose.Schema(
     classroomId: { type: String, required: true },
     type: { type: String, default: "announcement" },
     title: { type: String },
-    body: { type: String, required: true },
+    body: { type: String, default: "" },
     authorId: { type: String, required: true },
     authorName: { type: String, required: true },
     scheduledFor: { type: Date, required: true },
     published: { type: Boolean, default: false },
+    attachments: [
+      { name: String, url: String, pathname: String, size: Number, mime: String },
+    ],
+    dueDate: { type: Date },
+    points: { type: Number },
+    topic: { type: String, default: "" },
   },
   { timestamps: true },
 );
@@ -532,6 +540,7 @@ router.post("/:classroomId/posts", async (req, res) => {
       quizQuestions,
       pollOptions,
       attachments,
+      allowLateSubmissions,
     } = req.body;
 
     // FIX: authorId and authorName from token
@@ -547,6 +556,10 @@ router.post("/:classroomId/posts", async (req, res) => {
       topic: topic || "",
       dueDate: dueDate ? new Date(dueDate) : undefined,
       points: points ? Number(points) : undefined,
+      allowLateSubmissions:
+        allowLateSubmissions === undefined
+          ? true
+          : Boolean(allowLateSubmissions),
     };
 
     const parsedQuiz = parseMaybeJSON(quizQuestions);
@@ -815,6 +828,12 @@ router.post("/:classroomId/posts/:postId/submissions", async (req, res) => {
 
     const post = await Post.findOne({ postId: req.params.postId });
     const isLate = post?.dueDate && new Date() > new Date(post.dueDate);
+    if (isLate && post.allowLateSubmissions === false) {
+      return res.status(403).json({
+        error: "Late submissions are closed for this assignment",
+        code: "LATE_CLOSED",
+      });
+    }
 
     const doc = await Submission.create({
       submissionId: mkId(),
@@ -1235,15 +1254,30 @@ router.get("/:classroomId/scheduled", async (req, res) => {
 });
 
 router.post("/:classroomId/scheduled", async (req, res) => {
-  const { body, title, type, scheduledFor } = req.body;
+  const {
+    body,
+    title,
+    type,
+    scheduledFor,
+    attachments,
+    dueDate,
+    points,
+    topic,
+  } = req.body;
+  if (!scheduledFor) {
+    return res.status(400).json({ error: "scheduledFor required" });
+  }
   try {
     const sp = new ScheduledPost({
       classroomId: req.params.classroomId,
-      body,
-      title,
+      body: body || "",
+      title: title || "",
       type: type || "announcement",
       scheduledFor: new Date(scheduledFor),
-      // FIX: authorId and authorName from token
+      attachments: parseMaybeJSON(attachments) || [],
+      dueDate: dueDate ? new Date(dueDate) : undefined,
+      points: points ? Number(points) : undefined,
+      topic: topic || "",
       authorId: req.user.id,
       authorName: req.user.name,
     });

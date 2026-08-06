@@ -7,6 +7,7 @@
     "dev": "nodemon index.js",
     "test": "node --test __tests__/*.test.js",
     "load:events": "node scripts/load-events.js",
+    "load:events:longpoll": "node -e \"process.env.LONG_POLL='1'; require('./scripts/load-events.js')\"",
     "synthetic:health": "node scripts/synthetic-health.js"
   },
   "dependencies": {
