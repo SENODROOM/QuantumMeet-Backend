@@ -5,6 +5,10 @@
     {
       "path": "/api/cron/scheduled-posts",
       "schedule": "*/5 * * * *"
+    },
+    {
+      "path": "/api/cron/recordings-retention",
+      "schedule": "0 3 * * *"
     }
   ]
 }

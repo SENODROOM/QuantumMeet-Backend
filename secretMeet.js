@@ -11,11 +11,35 @@ const router = express.Router();
 router.post("/join", secretJoinLimiter, async (req, res) => {
   try {
     const { userId, userName } = req.body;
+    const { SecretBlock } = require("./models/platform");
     await SecretQueueEntry.deleteMany({ userId }); // clear any stale entry (rejoin)
 
-    const partner = await SecretQueueEntry.findOneAndDelete({
-      userId: { $ne: userId },
-    });
+    const blocked = await SecretBlock.find({
+      $or: [{ blockerId: userId }, { blockedId: userId }],
+    }).lean();
+    const blockedIds = new Set();
+    for (const b of blocked) {
+      blockedIds.add(b.blockerId);
+      blockedIds.add(b.blockedId);
+    }
+    blockedIds.delete(userId);
+
+    const candidates = await SecretQueueEntry.find({
+      userId: { $ne: userId, $nin: [...blockedIds] },
+    }).limit(20);
+    let partner = null;
+    for (const c of candidates) {
+      const mutual = await SecretBlock.findOne({
+        $or: [
+          { blockerId: userId, blockedId: c.userId },
+          { blockerId: c.userId, blockedId: userId },
+        ],
+      });
+      if (!mutual) {
+        partner = await SecretQueueEntry.findOneAndDelete({ userId: c.userId });
+        if (partner) break;
+      }
+    }
 
     if (partner) {
       const roomId = "secret-" + uuidv4().slice(0, 8);
@@ -66,6 +90,48 @@ router.post("/report", async (req, res) => {
       meta: { reason: (reason || "").slice(0, 500) },
     });
     res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post("/block", async (req, res) => {
+  try {
+    const { userId, targetUserId, reason } = req.body;
+    if (!userId || !targetUserId) {
+      return res.status(400).json({ error: "userId and targetUserId required" });
+    }
+    const { SecretBlock } = require("./models/platform");
+    await SecretBlock.findOneAndUpdate(
+      { blockerId: userId, blockedId: targetUserId },
+      {
+        blockerId: userId,
+        blockedId: targetUserId,
+        reason: (reason || "").slice(0, 500),
+      },
+      { upsert: true, new: true },
+    );
+    await audit({
+      action: "secret-block",
+      actorId: userId,
+      targetId: targetUserId,
+      meta: { reason: (reason || "").slice(0, 500) },
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/blocked", async (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: "userId required" });
+    const { SecretBlock } = require("./models/platform");
+    const rows = await SecretBlock.find({ blockerId: userId })
+      .select("blockedId reason createdAt")
+      .lean();
+    res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
