@@ -1,15 +1,13 @@
 const express = require("express");
 const { v4: uuidv4 } = require("uuid");
 
-const { publish } = require("./lib/ably");
+const { publishSecret, listSecretInbox } = require("./lib/events");
 const { SecretQueueEntry } = require("./models/realtime");
 
 const router = express.Router();
 
-// Random-pairing queue. No persistent connection to push the "matched"
-// notice to whichever side is still waiting, so the waiting client
-// subscribes to its own personal Ably channel (secret:{userId}) and this
-// endpoint publishes to it once someone else claims the queue entry.
+// Random-pairing queue. The waiting client polls GET /inbox; this endpoint
+// writes a SecretInbox row when someone else claims the queue entry.
 router.post("/join", async (req, res) => {
   try {
     const { userId, userName } = req.body;
@@ -21,7 +19,7 @@ router.post("/join", async (req, res) => {
 
     if (partner) {
       const roomId = "secret-" + uuidv4().slice(0, 8);
-      await publish("secret:" + partner.userId, "secret-matched", {
+      await publishSecret(partner.userId, "secret-matched", {
         roomId,
         partnerName: userName,
       });
@@ -39,6 +37,20 @@ router.post("/leave", async (req, res) => {
   try {
     await SecretQueueEntry.deleteMany({ userId: req.body.userId });
     res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/inbox", async (req, res) => {
+  try {
+    const { userId, since } = req.query;
+    if (!userId) return res.status(400).json({ error: "userId required" });
+    const events = await listSecretInbox(userId, since);
+    res.json({
+      events,
+      serverTime: new Date().toISOString(),
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

@@ -2,7 +2,17 @@ const express = require("express");
 const { v4: uuidv4 } = require("uuid");
 
 const Room = require("./models/room");
-const { publish, getAbly } = require("./lib/ably");
+const {
+  publish,
+  listEvents,
+  enterPresence,
+  heartbeatPresence,
+  leavePresence,
+  listPresence,
+  countPresence,
+  activePublicRoomIds,
+  removeUserFromRoom,
+} = require("./lib/events");
 const {
   Message,
   Poll,
@@ -18,7 +28,6 @@ const router = express.Router();
 // client generated for itself, same trust model the old socket.io server
 // used (roomHosts.get(roomId) === meta.userId, where meta.userId came from
 // the client's join-room payload, not a verified token).
-const channelFor = (roomId) => "room:" + roomId;
 
 async function isHost(roomId, userId) {
   if (!userId) return false;
@@ -55,6 +64,40 @@ router.post("/", async (req, res) => {
   }
 });
 
+router.get("/", async (req, res) => {
+  try {
+    let activeRoomIds = [];
+    try {
+      activeRoomIds = await activePublicRoomIds();
+    } catch {}
+
+    const dbRooms = await Room.find({
+      roomId: { $in: activeRoomIds },
+      isPublic: true,
+    }).catch(() => []);
+
+    const publicRooms = await Promise.all(
+      dbRooms.map(async (r) => {
+        let count = 0;
+        try {
+          count = await countPresence(r.roomId);
+        } catch {}
+        return {
+          roomId: r.roomId,
+          title: r.title || `${r.hostName}'s Meeting`,
+          hostName: r.hostName,
+          isPublic: r.isPublic,
+          participantCount: count,
+          createdAt: r.createdAt,
+        };
+      }),
+    );
+    res.json(publicRooms);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 router.get("/:roomId", async (req, res) => {
   try {
     const roomData = await Room.findOne({ roomId: req.params.roomId }).catch(
@@ -62,10 +105,7 @@ router.get("/:roomId", async (req, res) => {
     );
     let liveCount = 0;
     try {
-      const presence = await getAbly()
-        .channels.get(channelFor(req.params.roomId))
-        .presence.get();
-      liveCount = presence.length;
+      liveCount = await countPresence(req.params.roomId);
     } catch {}
     if (roomData)
       return res.json({ ...roomData.toObject(), participantCount: liveCount });
@@ -82,42 +122,76 @@ router.get("/:roomId", async (req, res) => {
   }
 });
 
-router.get("/", async (req, res) => {
+// ─── Event bus (signaling + ephemeral fan-out) ────────────────────────────
+router.post("/:roomId/events", async (req, res) => {
   try {
-    let activeRoomIds = [];
-    try {
-      const result = await getAbly().request("get", "/channels", null, {
-        prefix: "room:",
-        limit: 200,
-      });
-      activeRoomIds = result.items.map((c) => c.channelId.replace(/^room:/, ""));
-    } catch {}
+    const { roomId } = req.params;
+    const { event, payload = {}, from, to } = req.body;
+    if (!event || !from)
+      return res.status(400).json({ error: "event and from required" });
 
-    const dbRooms = await Room.find({
-      roomId: { $in: activeRoomIds },
-      isPublic: true,
-    }).catch(() => []);
+    const doc = await publish(roomId, event, payload, {
+      from,
+      to: to ?? payload?.to ?? null,
+    });
+    res.json({
+      id: doc._id.toString(),
+      createdAt: doc.createdAt.toISOString(),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
-    const publicRooms = await Promise.all(
-      dbRooms.map(async (r) => {
-        let count = 0;
-        try {
-          const presence = await getAbly()
-            .channels.get(channelFor(r.roomId))
-            .presence.get();
-          count = presence.length;
-        } catch {}
-        return {
-          roomId: r.roomId,
-          title: r.title || `${r.hostName}'s Meeting`,
-          hostName: r.hostName,
-          isPublic: r.isPublic,
-          participantCount: count,
-          createdAt: r.createdAt,
-        };
-      }),
-    );
-    res.json(publicRooms);
+router.get("/:roomId/events", async (req, res) => {
+  try {
+    const { since, userId } = req.query;
+    if (!userId) return res.status(400).json({ error: "userId required" });
+    const events = await listEvents(req.params.roomId, since, userId);
+    res.json({
+      events,
+      serverTime: new Date().toISOString(),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Presence ─────────────────────────────────────────────────────────────
+router.post("/:roomId/presence", async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const { userId, userName, connectionId, heartbeat } = req.body;
+    if (!userId || !connectionId)
+      return res.status(400).json({ error: "userId and connectionId required" });
+
+    if (heartbeat) {
+      await heartbeatPresence({ roomId, userId, userName, connectionId });
+    } else {
+      await enterPresence({ roomId, userId, userName, connectionId });
+    }
+    const members = await listPresence(roomId);
+    res.json({ members });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.delete("/:roomId/presence", async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const { userId, userName, connectionId } = req.body;
+    if (!userId) return res.status(400).json({ error: "userId required" });
+    await leavePresence({ roomId, userId, userName, connectionId });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/:roomId/presence", async (req, res) => {
+  try {
+    res.json(await listPresence(req.params.roomId));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -141,11 +215,12 @@ router.post("/:roomId/knock", async (req, res) => {
     );
 
     if (room?.host) {
-      await publish(channelFor(roomId), "knock-request", {
-        userId,
-        userName,
-        to: room.host,
-      });
+      await publish(
+        roomId,
+        "knock-request",
+        { userId, userName, socketId: userId, to: room.host },
+        { to: room.host },
+      );
       return res.json({ status: "pending" });
     }
     res.json({ status: "waiting" });
@@ -156,8 +231,6 @@ router.post("/:roomId/knock", async (req, res) => {
 
 router.get("/:roomId/knocks", async (req, res) => {
   try {
-    // Host reconnecting/loading the room re-fetches pending knocks instead
-    // of relying on the old in-memory replay-on-join behavior.
     const { userId } = req.query;
     if (!(await isHost(req.params.roomId, userId))) return res.json([]);
     res.json(await KnockRequest.find({ roomId: req.params.roomId }));
@@ -174,7 +247,7 @@ router.post("/:roomId/admit", async (req, res) => {
       return res.status(403).json({ error: "Not authorized" });
 
     await KnockRequest.deleteOne({ roomId, userId: targetUserId });
-    await publish(channelFor(roomId), "knock-accepted", { to: targetUserId });
+    await publish(roomId, "knock-accepted", { to: targetUserId }, { to: targetUserId });
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -189,7 +262,7 @@ router.post("/:roomId/reject", async (req, res) => {
       return res.status(403).json({ error: "Not authorized" });
 
     await KnockRequest.deleteOne({ roomId, userId: targetUserId });
-    await publish(channelFor(roomId), "knock-rejected", { to: targetUserId });
+    await publish(roomId, "knock-rejected", { to: targetUserId }, { to: targetUserId });
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -203,10 +276,12 @@ router.post("/:roomId/kick", async (req, res) => {
     if (!(await isHost(roomId, userId)))
       return res.status(403).json({ error: "Not authorized" });
 
-    await publish(channelFor(roomId), "kicked", { to: targetUserId });
-    await publish(channelFor(roomId), "user-left", {
+    await removeUserFromRoom(roomId, targetUserId);
+    await publish(roomId, "kicked", { to: targetUserId }, { to: targetUserId });
+    await publish(roomId, "user-left", {
       userId: targetUserId,
       userName: targetUserName,
+      socketId: targetUserId,
     });
     res.json({ ok: true });
   } catch (err) {
@@ -231,21 +306,28 @@ router.post("/:roomId/host-action", async (req, res) => {
       return res.status(403).json({ error: "Not authorized" });
 
     if (action === "wb-permission") {
-      await publish(channelFor(roomId), "wb-permission", {
-        to: targetUserId,
-        allowed,
-      });
+      await publish(
+        roomId,
+        "wb-permission",
+        { to: targetUserId, allowed },
+        { to: targetUserId },
+      );
     } else if (action === "grant-transcribe") {
-      await publish(channelFor(roomId), "transcribe-permission", {
-        to: targetUserId,
-        allowed,
-      });
+      await publish(
+        roomId,
+        "transcribe-permission",
+        { to: targetUserId, allowed },
+        { to: targetUserId },
+      );
     } else if (action === "mute-all" || action === "lower-all-hands") {
-      await publish(channelFor(roomId), HOST_ACTIONS[action], {});
+      await publish(roomId, HOST_ACTIONS[action], {});
     } else if (HOST_ACTIONS[action]) {
-      await publish(channelFor(roomId), HOST_ACTIONS[action], {
-        to: targetUserId,
-      });
+      await publish(
+        roomId,
+        HOST_ACTIONS[action],
+        { to: targetUserId },
+        { to: targetUserId },
+      );
     } else {
       return res.status(400).json({ error: "Unknown action" });
     }
@@ -289,7 +371,7 @@ router.post("/:roomId/chat", async (req, res) => {
       await Message.deleteMany({ _id: { $in: stale.map((m) => m._id) } });
     }
 
-    await publish(channelFor(roomId), "chat-message", doc);
+    await publish(roomId, "chat-message", doc.toObject ? doc.toObject() : doc);
     res.json(doc);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -318,7 +400,7 @@ router.post("/:roomId/polls", async (req, res) => {
       createdBy,
       options: options.map((text) => ({ text, votes: [] })),
     });
-    await publish(channelFor(roomId), "poll-new", poll);
+    await publish(roomId, "poll-new", poll.toObject ? poll.toObject() : poll);
     res.json(poll);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -340,7 +422,7 @@ router.post("/:roomId/polls/:pollId/vote", async (req, res) => {
       poll.options[optionIndex].votes.push(userId);
     await poll.save();
 
-    await publish(channelFor(roomId), "poll-updated", poll);
+    await publish(roomId, "poll-updated", poll.toObject ? poll.toObject() : poll);
     res.json(poll);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -360,7 +442,7 @@ router.post("/:roomId/polls/:pollId/end", async (req, res) => {
     poll.active = false;
     await poll.save();
 
-    await publish(channelFor(roomId), "poll-updated", poll);
+    await publish(roomId, "poll-updated", poll.toObject ? poll.toObject() : poll);
     res.json(poll);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -387,7 +469,7 @@ router.post("/:roomId/qna", async (req, res) => {
       askerName: anonymous ? "Anonymous" : askerName,
       anonymous: !!anonymous,
     });
-    await publish(channelFor(roomId), "qna-new", q);
+    await publish(roomId, "qna-new", q.toObject ? q.toObject() : q);
     res.json(q);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -404,7 +486,7 @@ router.post("/:roomId/qna/:qId/upvote", async (req, res) => {
       q.upvotes = q.upvotes.filter((v) => v !== userId);
     else q.upvotes.push(userId);
     await q.save();
-    await publish(channelFor(roomId), "qna-updated", q);
+    await publish(roomId, "qna-updated", q.toObject ? q.toObject() : q);
     res.json(q);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -421,7 +503,7 @@ router.patch("/:roomId/qna/:qId/answered", async (req, res) => {
     if (!q) return res.status(404).json({ error: "Not found" });
     q.answered = !q.answered;
     await q.save();
-    await publish(channelFor(roomId), "qna-updated", q);
+    await publish(roomId, "qna-updated", q.toObject ? q.toObject() : q);
     res.json(q);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -442,7 +524,7 @@ router.patch("/:roomId/qna/:qId/pin", async (req, res) => {
     await q.save();
 
     const all = await Question.find({ roomId }).sort({ createdAt: 1 });
-    await publish(channelFor(roomId), "qna-all", all);
+    await publish(roomId, "qna-all", all);
     res.json(all);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -458,7 +540,7 @@ router.delete("/:roomId/qna/:qId", async (req, res) => {
 
     await Question.deleteOne({ _id: qId, roomId });
     const all = await Question.find({ roomId }).sort({ createdAt: 1 });
-    await publish(channelFor(roomId), "qna-all", all);
+    await publish(roomId, "qna-all", all);
     res.json(all);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -486,7 +568,7 @@ router.post("/:roomId/breakout", async (req, res) => {
       { roomId, rooms: breakoutRooms, active: true },
       { upsert: true, new: true },
     );
-    await publish(channelFor(roomId), "breakout-started", { breakoutRooms });
+    await publish(roomId, "breakout-started", { breakoutRooms });
     res.json(session);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -500,10 +582,12 @@ router.post("/:roomId/breakout/assign", async (req, res) => {
     if (!(await isHost(roomId, userId)))
       return res.status(403).json({ error: "Not authorized" });
 
-    await publish(channelFor(roomId), "breakout-assigned", {
-      to: targetUserId,
-      breakoutRoomId,
-    });
+    await publish(
+      roomId,
+      "breakout-assigned",
+      { to: targetUserId, breakoutRoomId },
+      { to: targetUserId },
+    );
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -518,7 +602,7 @@ router.delete("/:roomId/breakout", async (req, res) => {
       return res.status(403).json({ error: "Not authorized" });
 
     await BreakoutSession.deleteOne({ roomId });
-    await publish(channelFor(roomId), "breakout-ended", {});
+    await publish(roomId, "breakout-ended", {});
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -532,7 +616,7 @@ router.post("/:roomId/breakout/broadcast", async (req, res) => {
     if (!(await isHost(roomId, userId)))
       return res.status(403).json({ error: "Not authorized" });
 
-    await publish(channelFor(roomId), "breakout-broadcast-msg", {
+    await publish(roomId, "breakout-broadcast-msg", {
       message,
       from: "Host",
     });
@@ -549,7 +633,7 @@ router.post("/:roomId/breakout/callback", async (req, res) => {
     if (!(await isHost(roomId, userId)))
       return res.status(403).json({ error: "Not authorized" });
 
-    await publish(channelFor(roomId), "breakout-callback", {});
+    await publish(roomId, "breakout-callback", {});
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });

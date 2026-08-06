@@ -1,40 +1,55 @@
-# ⬡ QuantumMeet Server
+# QuantumMeet Server
 
-The backend signaling server and REST API for **QuantumMeet**. This Node.js server acts as the central hub for room orchestration, Socket.io signaling (for WebRTC handshakes), state synchronization, and database persistence.
+Express REST API for **QuantumMeet**. Runs locally with `node`/`nodemon` and deploys as a **Vercel serverless** function. Signaling and room fan-out use a **Mongo-backed event bus** (clients short-poll); durable meeting state also lives in MongoDB. Media is peer-to-peer WebRTC — not relayed here.
 
-## ⚙️ Core Responsibilities
+## Responsibilities
 
-1. **Signaling Server**: Coordinates the exchange of SDP Offers, Answers, and ICE Candidates between peers to establish P2P WebRTC connections.
-2. **Room Management**: Keeps track of active users, host status, and metadata per active session.
-3. **State Synchronization**: Relays events for Chat Messages, Polls, Q&A, Hand raising, and video/audio toggle states.
-4. **Database Persistence**: Stores room histories, settings, and optionally manages authentication against a MongoDB instance.
+1. **REST API** — rooms, chat, polls, Q&A, breakouts, knocks, SecretMeet queue, classroom LMS
+2. **Event bus** — `POST/GET /api/rooms/:roomId/events` for WebRTC signaling, whiteboard, and post-write fan-out
+3. **Presence** — heartbeat membership for peer discovery and public room counts
+4. **SecretMeet inbox** — `GET /api/secret/inbox` for match notifications
+5. **Persistence** — Mongo models with TTL; connection cached for warm lambdas
+6. **Classroom uploads** — Vercel Blob client upload tokens
 
-## 🛠️ Built With
+## Built With
 
-- **Node.js**
-- **Express.js** (for REST endpoints)
-- **Socket.io** (for WebSockets)
-- **Mongoose / MongoDB** (for persistence)
+- Node.js + Express
+- Mongoose / MongoDB
+- `@vercel/blob` (classroom files)
+- JWT (classroom auth)
 
-## 🚀 Running The Server Locally
+## Local setup
 
-1. Install dependencies:
-   ```bash
-   npm install
-   ```
+```bash
+npm install
+cp .env.example .env
+```
 
-2. Establish `.env` variables:
-   ```bash
-   cp .env.example .env
-   ```
-   Provide a valid `MONGO_URI` (though the server will fallback gracefully if MongoDB is uncontactable). Ensure `PORT` and `CLIENT_URL` are set.
+Required env (see `.env.example`):
 
-3. Start server in development mode:
-   ```bash
-   npm run dev
-   ```
-   Starts `nodemon` to watch for file changes automatically. The server runs on `http://localhost:5000` by default.
+| Variable | Purpose |
+|---|---|
+| `MONGO_URI` | Mongo connection (required for signaling + shared state) |
+| `CLIENT_URL` | CORS primary origin |
+| `JWT_SECRET` | Classroom auth |
+| `BLOB_READ_WRITE_TOKEN` | Classroom uploads (local) |
+| `EXTRA_ALLOWED_ORIGINS` | Optional extra CORS origins |
+
+```bash
+npm run dev   # nodemon → http://localhost:5000
+npm start     # node
+```
+
+Health check: `GET /api/health`
+
+## Vercel deploy
+
+- Project root: `server/`
+- Config: `vercel.json` rewrites all paths to `index.js`
+- Set the same env vars in the Vercel project (Blob token is injected when Blob storage is enabled)
+
+Login rate limiting uses the default in-memory store (per instance, not shared across lambdas).
 
 ---
 
-<p align="center">The core engine powering QuantumMeet.</p>
+<p align="center">The API powering QuantumMeet on Vercel</p>

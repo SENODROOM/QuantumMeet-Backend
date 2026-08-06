@@ -58,6 +58,34 @@ const knockRequestSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now, expires: 86400 },
 });
 
+// Ephemeral fan-out bus (signaling, whiteboard, post-write pushes). Short TTL
+// — clients poll; stale ICE/offers must not linger.
+const roomEventSchema = new mongoose.Schema({
+  roomId: { type: String, required: true, index: true },
+  event: { type: String, required: true },
+  payload: { type: mongoose.Schema.Types.Mixed, default: {} },
+  to: { type: String, default: null, index: true },
+  from: { type: String, default: null },
+  createdAt: { type: Date, default: Date.now, expires: 300, index: true },
+});
+roomEventSchema.index({ roomId: 1, createdAt: 1 });
+
+const secretInboxSchema = new mongoose.Schema({
+  userId: { type: String, required: true, index: true },
+  event: { type: String, required: true },
+  payload: { type: mongoose.Schema.Types.Mixed, default: {} },
+  createdAt: { type: Date, default: Date.now, expires: 120 },
+});
+
+const presenceSchema = new mongoose.Schema({
+  roomId: { type: String, required: true, index: true },
+  userId: { type: String, required: true },
+  userName: { type: String, required: true },
+  connectionId: { type: String, required: true },
+  lastSeen: { type: Date, default: Date.now, index: true },
+});
+presenceSchema.index({ roomId: 1, userId: 1, connectionId: 1 }, { unique: true });
+
 function model(name, schema) {
   try {
     return mongoose.model(name);
@@ -73,4 +101,7 @@ module.exports = {
   BreakoutSession: model("BreakoutSession", breakoutSessionSchema),
   SecretQueueEntry: model("SecretQueueEntry", secretQueueSchema),
   KnockRequest: model("KnockRequest", knockRequestSchema),
+  RoomEvent: model("RoomEvent", roomEventSchema),
+  SecretInbox: model("SecretInbox", secretInboxSchema),
+  Presence: model("Presence", presenceSchema),
 };

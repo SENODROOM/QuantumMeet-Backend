@@ -79,10 +79,6 @@ app.use("/api/rooms", roomRealtimeRouter);
 const secretMeetRouter = require("./secretMeet");
 app.use("/api/secret", secretMeetRouter);
 
-// ── Ably token minting ────────────────────────────────────────────────────────
-const realtimeTokenRouter = require("./realtimeToken");
-app.use("/api/realtime", realtimeTokenRouter);
-
 // Health check
 app.get("/api/health", (_, res) =>
   res.json({ status: "ok", time: new Date() }),
