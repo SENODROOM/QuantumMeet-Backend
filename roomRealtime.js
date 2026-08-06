@@ -835,20 +835,31 @@ router.delete("/:roomId/retention", async (req, res) => {
 
 /**
  * Recording upload: client records locally then uploads to Blob via classroom
- * blob-upload token when classroomId is set. This endpoint only logs metadata.
+ * blob-upload token when classroomId is set. Persists metadata for retention.
  */
 router.post("/:roomId/recordings", async (req, res) => {
   try {
     const { roomId } = req.params;
     const { userId, blobUrl, durationSec, classroomId } = req.body;
+    const { v4: uuidv4 } = require("uuid");
+    const { Recording } = require("./models/platform");
+    const recordingId = uuidv4();
+    await Recording.create({
+      recordingId,
+      roomId,
+      classroomId,
+      actorId: userId,
+      blobUrl,
+      durationSec,
+    });
     await audit({
       action: "recording-saved",
       roomId,
       classroomId,
       actorId: userId,
-      meta: { blobUrl, durationSec },
+      meta: { blobUrl, durationSec, recordingId },
     });
-    res.json({ ok: true });
+    res.json({ ok: true, recordingId });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

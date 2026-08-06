@@ -78,7 +78,13 @@ const DB_REQUIRED_PREFIXES = [
   "/api/auth",
   "/api/growth",
   "/api/cron",
+  "/api/partner",
 ];
+
+const DB_OPTIONAL_EXACT = new Set([
+  "/api/growth/features",
+  "/api/growth/cost/mau",
+]);
 
 app.use(async (req, res, next) => {
   try {
@@ -91,7 +97,9 @@ app.use(async (req, res, next) => {
       requestId: req.requestId,
       path: req.path,
     });
-    const needsDb = DB_REQUIRED_PREFIXES.some((p) => req.path.startsWith(p));
+    const needsDb =
+      DB_REQUIRED_PREFIXES.some((p) => req.path.startsWith(p)) &&
+      !DB_OPTIONAL_EXACT.has(req.path);
     if (needsDb) {
       return res.status(503).json({
         error: "Database unavailable",
@@ -131,6 +139,9 @@ app.use("/api/sfu", require("./sfu"));
 
 // ── Partner API keys ──────────────────────────────────────────────────────────
 app.use("/api/partner", require("./partnerApi"));
+
+// ── Call quality metrics (client beacons) ─────────────────────────────────────
+app.use("/api/metrics", require("./callQuality"));
 
 // ── Cron (scheduled classroom posts) ──────────────────────────────────────────
 const cronRouter = require("./cron");
@@ -175,12 +186,20 @@ app.get("/api/health", async (req, res) => {
 // ─── Start (local dev only — Vercel imports `app` as the request handler) ────
 if (require.main === module) {
   const PORT = process.env.PORT || 5000;
+  const listen = () => {
+    app.listen(PORT, () => console.log(`🚀 Server on http://localhost:${PORT}`));
+  };
   connectDB()
     .then(() => {
       console.log("✅ MongoDB connected");
-      app.listen(PORT, () => console.log(`🚀 Server on http://localhost:${PORT}`));
+      listen();
     })
     .catch((err) => {
+      if (process.env.CI_ALLOW_NO_DB === "1") {
+        console.warn("⚠️  CI_ALLOW_NO_DB: starting without Mongo:", err.message);
+        listen();
+        return;
+      }
       console.error("❌ MongoDB required for meetings — refusing to start:", err.message);
       process.exit(1);
     });

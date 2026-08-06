@@ -18,6 +18,24 @@ router.get("/features", (_req, res) => {
   });
 });
 
+/** Cost / MAU draft snapshot (platform inputs via env). */
+router.get("/cost/mau", (_req, res) => {
+  const atlas = Number(process.env.COST_ATLAS_USD || 0);
+  const vercel = Number(process.env.COST_VERCEL_USD || 0);
+  const turn = Number(process.env.COST_TURN_USD || 0);
+  const blob = Number(process.env.COST_BLOB_USD || 0);
+  const mau = Number(process.env.COST_MAU || 0);
+  const total = atlas + vercel + turn + blob;
+  res.json({
+    formula: "cost_per_mau = (atlas+vercel+turn+blob) / mau",
+    inputs: { atlas, vercel, turn, blob, mau },
+    monthlyInfraUsd: total,
+    costPerMau: mau > 0 ? Number((total / mau).toFixed(4)) : null,
+    region: require("./lib/region").regionSnapshot(),
+    asOf: new Date().toISOString(),
+  });
+});
+
 router.use(auth);
 
 // ── Meeting schedules ─────────────────────────────────────────────────────────
@@ -215,8 +233,55 @@ router.patch("/orgs/:orgId", async (req, res) => {
     if (req.body.featureFlags && typeof req.body.featureFlags === "object") {
       org.featureFlags = { ...(org.featureFlags || {}), ...req.body.featureFlags };
     }
+    if (req.body.billingPlan != null) {
+      org.billingPlan = String(req.body.billingPlan).slice(0, 40);
+    }
+    if (req.body.billingStatus != null) {
+      org.billingStatus = String(req.body.billingStatus).slice(0, 40);
+    }
     await org.save();
     res.json(org);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** Pilot billing: record an invoice event (no payment processor). */
+router.post("/orgs/:orgId/billing/invoice", async (req, res) => {
+  if (!flags.orgsEnabled()) {
+    return res.status(503).json({ error: "Orgs feature flag disabled" });
+  }
+  try {
+    const org = await Org.findOne({ orgId: req.params.orgId });
+    if (!org) return res.status(404).json({ error: "Org not found" });
+    const me = org.members.find((m) => m.userId === req.user.id);
+    if (!me || !["owner", "admin"].includes(me.role)) {
+      return res.status(403).json({ error: "Not authorized" });
+    }
+    const seats = org.seatLimit || 50;
+    const unitUsd = Number(req.body.unitUsd || process.env.PILOT_SEAT_USD || 5);
+    const amountUsd = Number((seats * unitUsd).toFixed(2));
+    await require("./lib/audit").audit({
+      action: "pilot-invoice",
+      actorId: req.user.id,
+      meta: {
+        orgId: org.orgId,
+        seats,
+        unitUsd,
+        amountUsd,
+        plan: org.billingPlan || "pilot",
+      },
+    });
+    org.billingStatus = "invoiced";
+    await org.save();
+    res.json({
+      ok: true,
+      orgId: org.orgId,
+      seats,
+      unitUsd,
+      amountUsd,
+      billingStatus: org.billingStatus,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

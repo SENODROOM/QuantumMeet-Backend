@@ -1152,6 +1152,9 @@ router.get("/:classroomId/analytics", async (req, res) => {
             0,
           ) / graded.length
         : null;
+      const submissionRate = students.length
+        ? Math.round((subs.length / students.length) * 100)
+        : 0;
       return {
         postId: a.postId,
         title: a.title,
@@ -1160,6 +1163,7 @@ router.get("/:classroomId/analytics", async (req, res) => {
         graded: graded.length,
         avgGrade,
         points: a.points,
+        submissionRate,
       };
     });
 
@@ -1191,16 +1195,62 @@ router.get("/:classroomId/analytics", async (req, res) => {
       else distribution.F++;
     });
 
+    const expectedSubs = students.length * assignments.length;
+    const submissionRate = expectedSubs
+      ? Math.round((submissions.length / expectedSubs) * 100)
+      : 0;
+    const classAvg = allGrades.length
+      ? Number(
+          (allGrades.reduce((a, b) => a + b, 0) / allGrades.length).toFixed(1),
+        )
+      : null;
+
+    const byAssignment = {};
+    for (const a of assignmentStats) {
+      byAssignment[a.postId] = {
+        submissionRate: a.submissionRate,
+        avgGrade: a.avgGrade,
+        submitted: a.submitted,
+      };
+    }
+
+    const atRisk = studentStats
+      .filter(
+        (s) =>
+          (s.avgGrade != null && s.avgGrade < 60) ||
+          s.missing >= Math.max(1, Math.floor(assignments.length / 2)),
+      )
+      .map((s) => ({
+        userId: s.userId,
+        userName: s.userName,
+        avgGrade: s.avgGrade,
+        missing: s.missing,
+      }));
+
     res.json({
       studentStats,
       assignmentStats,
       sessionStats,
       distribution,
+      gradeDistribution: {
+        "A (90-100)": distribution.A,
+        "B (80-89)": distribution.B,
+        "C (70-79)": distribution.C,
+        "D (60-69)": distribution.D,
+        "F (<60)": distribution.F,
+      },
+      byAssignment,
+      submissionRate,
+      averageGrade: classAvg,
       totalStudents: students.length,
       totalSessions: sessions.length,
-      classAvg: allGrades.length
-        ? (allGrades.reduce((a, b) => a + b, 0) / allGrades.length).toFixed(1)
-        : null,
+      classAvg,
+      atRisk,
+      attendanceTrend: sessionStats.map((s) => ({
+        sessionId: s.sessionId,
+        attendeeCount: s.attendeeCount,
+        startedAt: s.startedAt,
+      })),
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1256,12 +1306,29 @@ router.post("/:classroomId/attendance/from-presence", async (req, res) => {
     const { roomId, sessionId } = req.body;
     const { listPresence } = require("./lib/events");
     const members = await listPresence(roomId);
-    const records = members.map((m) => ({
-      studentId: m.userId,
-      studentName: m.userName,
-      status: "present",
-      joinTime: new Date(),
+    const classroom = await Classroom.findOne({
+      classroomId: req.params.classroomId,
+    }).lean();
+    const students =
+      classroom?.members?.filter((m) => m.role === "student") || [];
+    const presentIds = new Set(members.map((m) => m.userId));
+    const records = students.map((s) => ({
+      studentId: s.userId,
+      studentName: s.userName,
+      status: presentIds.has(s.userId) ? "present" : "absent",
+      joinTime: presentIds.has(s.userId) ? new Date() : null,
     }));
+    // Also mark guests in presence who aren't rostered
+    for (const m of members) {
+      if (!records.find((r) => r.studentId === m.userId)) {
+        records.push({
+          studentId: m.userId,
+          studentName: m.userName,
+          status: "present",
+          joinTime: new Date(),
+        });
+      }
+    }
     const existing = await Attendance.findOne({
       classroomId: req.params.classroomId,
       sessionId,
@@ -1280,6 +1347,63 @@ router.post("/:classroomId/attendance/from-presence", async (req, res) => {
       records,
     });
     res.json(a);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/** Attendance accuracy study vs roster (KR3.6 light). */
+router.get("/:classroomId/attendance/accuracy", async (req, res) => {
+  try {
+    const classroom = await Classroom.findOne({
+      classroomId: req.params.classroomId,
+    }).lean();
+    const students =
+      classroom?.members?.filter((m) => m.role === "student") || [];
+    const roster = students.length;
+    const rows = await Attendance.find({
+      classroomId: req.params.classroomId,
+    })
+      .lean()
+      .sort({ date: -1 })
+      .limit(50);
+    const sessions = rows.map((row) => {
+      const present = (row.records || []).filter((r) => r.status === "present");
+      const rosterPresent = present.filter((r) =>
+        students.some((s) => s.userId === r.studentId),
+      ).length;
+      const coverage = roster
+        ? Number(((rosterPresent / roster) * 100).toFixed(1))
+        : null;
+      return {
+        sessionId: row.sessionId,
+        date: row.date,
+        roster,
+        presentCount: present.length,
+        rosterPresent,
+        coveragePct: coverage,
+      };
+    });
+    const withCov = sessions.filter((s) => s.coveragePct != null);
+    const avgCoverage = withCov.length
+      ? Number(
+          (
+            withCov.reduce((a, s) => a + s.coveragePct, 0) / withCov.length
+          ).toFixed(1),
+        )
+      : null;
+    res.json({
+      classroomId: req.params.classroomId,
+      rosterSize: roster,
+      sessionsStudied: sessions.length,
+      avgRosterCoveragePct: avgCoverage,
+      targetPct: Number(process.env.ATTENDANCE_ACCURACY_TARGET || 90),
+      meetsTarget:
+        avgCoverage == null
+          ? null
+          : avgCoverage >= Number(process.env.ATTENDANCE_ACCURACY_TARGET || 90),
+      sessions,
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

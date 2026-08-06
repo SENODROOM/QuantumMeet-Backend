@@ -152,10 +152,48 @@ router.get("/oidc/start", (req, res) => {
   res.json({ authorizeUrl: url.toString(), state });
 });
 
-router.get("/oidc/callback", (_req, res) => {
-  res.status(501).json({
-    error: "OIDC callback not implemented",
-    code: "OIDC_CALLBACK_PENDING",
+router.get("/oidc/callback", async (req, res) => {
+  const flags = require("../lib/featureFlags");
+  if (!flags.ssoEnabled()) {
+    return res.status(503).json({
+      error: "SSO not enabled",
+      code: "SSO_DISABLED",
+    });
+  }
+  // Pilot / staging: OIDC_MOCK=1 issues a JWT without IdP token exchange.
+  if (process.env.OIDC_MOCK === "1") {
+    try {
+      const email =
+        String(req.query.email || "sso.pilot@example.com").toLowerCase();
+      const name = String(req.query.name || "SSO Pilot");
+      let user = await User.findOne({ email });
+      if (!user) {
+        user = await User.create({
+          name,
+          email,
+          password: require("crypto").randomBytes(24).toString("hex"),
+        });
+      }
+      const token = signToken(user);
+      return res.json({
+        token,
+        user: safeUser(user),
+        mode: "oidc_mock",
+      });
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+  if (!process.env.OIDC_CLIENT_SECRET) {
+    return res.status(501).json({
+      error: "OIDC callback requires OIDC_CLIENT_SECRET or OIDC_MOCK=1",
+      code: "OIDC_CALLBACK_PENDING",
+    });
+  }
+  return res.status(501).json({
+    error: "Full OIDC token exchange not wired — use OIDC_MOCK=1 for pilots",
+    code: "OIDC_TOKEN_EXCHANGE_PENDING",
+    hint: "Configure openid-client against OIDC_ISSUER when ready",
   });
 });
 

@@ -18,6 +18,8 @@ const orgSchema = new mongoose.Schema({
   name: { type: String, required: true },
   ownerId: { type: String, required: true },
   seatLimit: { type: Number, default: 50 },
+  billingPlan: { type: String, default: "pilot" },
+  billingStatus: { type: String, default: "active" },
   members: [{ userId: String, role: { type: String, default: "member" } }],
   featureFlags: { type: mongoose.Schema.Types.Mixed, default: {} },
   createdAt: { type: Date, default: Date.now },
