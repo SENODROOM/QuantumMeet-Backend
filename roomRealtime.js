@@ -172,6 +172,19 @@ router.post("/:roomId/events", eventsPostLimiter, async (req, res) => {
       createdAt: doc.createdAt.toISOString(),
     });
   } catch (err) {
+    if (err.code === "PAYLOAD_TOO_LARGE") {
+      require("./lib/log").warn("event_payload_too_large", {
+        roomId: req.params.roomId,
+        event: req.body?.event,
+        requestId: req.requestId,
+      });
+      return res.status(413).json({ error: "Event payload too large" });
+    }
+    require("./lib/log").error("event_publish_failed", {
+      roomId: req.params.roomId,
+      err: err.message,
+      requestId: req.requestId,
+    });
     res.status(500).json({ error: err.message });
   }
 });

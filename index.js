@@ -17,6 +17,11 @@ if (process.env.SENTRY_DSN) {
 }
 
 const app = express();
+const log = require("./lib/log");
+const { requestIdMiddleware } = require("./lib/requestId");
+const { getIceConfig } = require("./lib/ice");
+
+app.use(requestIdMiddleware);
 
 const allowedOrigins = [
   "https://meet.quantumlogicslimited.com",
@@ -79,11 +84,17 @@ app.use(async (req, res, next) => {
     next();
   } catch (err) {
     console.warn("⚠️  DB unavailable:", err.message);
+    log.error("db_connect_failed", {
+      err: err.message,
+      requestId: req.requestId,
+      path: req.path,
+    });
     const needsDb = DB_REQUIRED_PREFIXES.some((p) => req.path.startsWith(p));
     if (needsDb) {
       return res.status(503).json({
         error: "Database unavailable",
         code: "DB_UNAVAILABLE",
+        requestId: req.requestId,
       });
     }
     next();
@@ -114,8 +125,17 @@ app.use("/api/growth", growthRouter);
 const cronRouter = require("./cron");
 app.use("/api/cron", cronRouter);
 
+// ICE config for clients (no DB — TURN creds stay server-side)
+app.get("/api/ice", (_req, res) => {
+  const cfg = getIceConfig();
+  res.json({
+    iceServers: cfg.iceServers,
+    hasTurn: cfg.hasTurn,
+  });
+});
+
 // Health check — reports DB state (never fail-closed; used by probes)
-app.get("/api/health", async (_req, res) => {
+app.get("/api/health", async (req, res) => {
   let db = "disconnected";
   try {
     if (!isDbReady()) await connectDB();
@@ -123,10 +143,14 @@ app.get("/api/health", async (_req, res) => {
   } catch {
     db = "disconnected";
   }
+  const ice = getIceConfig();
   res.status(db === "connected" ? 200 : 503).json({
     status: db === "connected" ? "ok" : "degraded",
     db,
     time: new Date(),
+    requestId: req.requestId,
+    ice: { hasTurn: ice.hasTurn },
+    metrics: require("./lib/metrics").snapshot(),
     features: {
       longPoll: require("./lib/featureFlags").longPollEnabled(),
       sfu: require("./lib/featureFlags").sfuEnabled(),
