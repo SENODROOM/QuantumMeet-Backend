@@ -467,6 +467,44 @@ router.delete("/:classroomId/members/:memberId", async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
+// CLASSROOM TEMPLATES (E-802 light)
+// ═════════════════════════════════════════════════════════════════════════════
+
+router.get("/meta/templates", (_req, res) => {
+  res.json([
+    {
+      id: "stem-lab",
+      name: "STEM Lab",
+      description: "Assignments + materials + weekly quiz",
+      theme: "cyan",
+      starterPosts: [
+        { type: "announcement", title: "Welcome", body: "Syllabus and lab safety." },
+        { type: "assignment", title: "Lab 1", body: "Submit your write-up.", points: 100 },
+      ],
+    },
+    {
+      id: "language-seminar",
+      name: "Language Seminar",
+      description: "Discussion-heavy with attendance",
+      theme: "violet",
+      starterPosts: [
+        { type: "announcement", title: "Seminar norms", body: "Cameras optional; participation counted." },
+        { type: "material", title: "Reading pack", body: "Week 1 texts." },
+      ],
+    },
+    {
+      id: "exam-prep",
+      name: "Exam Prep",
+      description: "Quiz-forward classroom",
+      theme: "amber",
+      starterPosts: [
+        { type: "quiz", title: "Practice quiz", body: "Ungraded practice." },
+      ],
+    },
+  ]);
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
 // TOPICS
 // ═════════════════════════════════════════════════════════════════════════════
 

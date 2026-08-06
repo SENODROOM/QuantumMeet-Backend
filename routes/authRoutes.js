@@ -118,6 +118,47 @@ router.get("/me", require("../middleware/auth"), async (req, res) => {
   }
 });
 
+// ── OIDC / SSO stubs (E-401) ──────────────────────────────────────────────────
+router.get("/oidc/start", (req, res) => {
+  const flags = require("../lib/featureFlags");
+  if (!flags.ssoEnabled()) {
+    return res.status(503).json({
+      error: "SSO not enabled",
+      code: "SSO_DISABLED",
+      hint: "Set FEATURE_SSO=1 and configure OIDC_ISSUER / OIDC_CLIENT_ID",
+    });
+  }
+  const issuer = process.env.OIDC_ISSUER;
+  const clientId = process.env.OIDC_CLIENT_ID;
+  if (!issuer || !clientId) {
+    return res.status(501).json({
+      error: "OIDC not configured",
+      code: "OIDC_NOT_CONFIGURED",
+    });
+  }
+  const redirect =
+    process.env.OIDC_REDIRECT_URI ||
+    `${process.env.CLIENT_URL || "http://localhost:3000"}/login`;
+  const state = require("crypto").randomBytes(16).toString("hex");
+  const url = new URL(
+    `${issuer.replace(/\/$/, "")}/authorize`,
+  );
+  // Generic authorize path — real IdPs vary; wire openid-client in full epic
+  url.searchParams.set("client_id", clientId);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("scope", "openid email profile");
+  url.searchParams.set("redirect_uri", redirect);
+  url.searchParams.set("state", state);
+  res.json({ authorizeUrl: url.toString(), state });
+});
+
+router.get("/oidc/callback", (_req, res) => {
+  res.status(501).json({
+    error: "OIDC callback not implemented",
+    code: "OIDC_CALLBACK_PENDING",
+  });
+});
+
 // ── GET /api/auth/me/export — self-serve data export (E-403) ─────────────────
 router.get("/me/export", require("../middleware/auth"), async (req, res) => {
   try {

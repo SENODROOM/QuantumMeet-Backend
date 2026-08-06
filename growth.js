@@ -12,8 +12,10 @@ router.get("/features", (_req, res) => {
     meshSoftCap: flags.meshSoftCap(),
     sfuThreshold: flags.sfuThreshold(),
     sfuEnabled: flags.sfuEnabled(),
+    sfuVendor: flags.sfuVendor(),
     longPollEnabled: flags.longPollEnabled(),
     orgsEnabled: flags.orgsEnabled(),
+    ssoEnabled: flags.ssoEnabled(),
   });
 });
 
@@ -57,6 +59,43 @@ router.delete("/schedules/:scheduleId", async (req, res) => {
       hostUserId: req.user.id,
     });
     res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** ICS download for a schedule (E-705 light). */
+router.get("/schedules/:scheduleId/ics", async (req, res) => {
+  try {
+    const doc = await MeetingSchedule.findOne({
+      scheduleId: req.params.scheduleId,
+    });
+    if (!doc) return res.status(404).json({ error: "Not found" });
+    const start = new Date(doc.startsAt);
+    const end = new Date(start.getTime() + (doc.durationMin || 60) * 60_000);
+    const fmt = (d) =>
+      d.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+    const uid = `${doc.scheduleId}@quantummeet`;
+    const ics = [
+      "BEGIN:VCALENDAR",
+      "VERSION:2.0",
+      "PRODID:-//QuantumMeet//EN",
+      "BEGIN:VEVENT",
+      `UID:${uid}`,
+      `DTSTAMP:${fmt(new Date())}`,
+      `DTSTART:${fmt(start)}`,
+      `DTEND:${fmt(end)}`,
+      `SUMMARY:${(doc.title || "Meeting").replace(/[,;\\]/g, " ")}`,
+      doc.classroomId ? `DESCRIPTION:Classroom ${doc.classroomId}` : "DESCRIPTION:QuantumMeet",
+      "END:VEVENT",
+      "END:VCALENDAR",
+    ].join("\r\n");
+    res.setHeader("Content-Type", "text/calendar; charset=utf-8");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="qm-${doc.scheduleId}.ics"`,
+    );
+    res.send(ics);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -199,23 +238,51 @@ router.post("/webhooks", async (req, res) => {
   }
 });
 
-/** Fire session-end webhooks (best-effort). */
+/** Fire session-end webhooks with HMAC signature + retry once (E-706 light). */
 async function notifySessionEnd(payload) {
+  const metrics = require("./lib/metrics");
+  const crypto = require("crypto");
   try {
     const hooks = await WebhookEndpoint.find({
       events: "session.end",
     }).limit(20);
+    const body = JSON.stringify({ event: "session.end", ...payload });
     await Promise.all(
-      hooks.map((h) =>
-        fetch(h.url, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-QM-Secret": h.secret || "",
-          },
-          body: JSON.stringify({ event: "session.end", ...payload }),
-        }).catch(() => null),
-      ),
+      hooks.map(async (h) => {
+        const sig = crypto
+          .createHmac("sha256", h.secret || "")
+          .update(body)
+          .digest("hex");
+        const headers = {
+          "Content-Type": "application/json",
+          "X-QM-Secret": h.secret || "",
+          "X-QM-Signature": `sha256=${sig}`,
+        };
+        const send = () =>
+          fetch(h.url, { method: "POST", headers, body });
+        try {
+          let res = await send();
+          if (!res.ok) {
+            await new Promise((r) => setTimeout(r, 250));
+            res = await send();
+          }
+          if (res.ok) metrics.inc("webhookDeliveries");
+          else {
+            metrics.inc("webhookFailures");
+            // DLQ stub: log only
+            require("./lib/log").warn("webhook_dlq", {
+              url: h.url,
+              status: res.status,
+            });
+          }
+        } catch (err) {
+          metrics.inc("webhookFailures");
+          require("./lib/log").warn("webhook_dlq", {
+            url: h.url,
+            err: err.message,
+          });
+        }
+      }),
     );
   } catch (err) {
     console.warn("[webhook]", err.message);

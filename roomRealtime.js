@@ -127,6 +127,7 @@ router.get("/config/realtime", (_req, res) => {
     meshSoftCap: flags.meshSoftCap(),
     sfuThreshold: flags.sfuThreshold(),
     sfuEnabled: flags.sfuEnabled(),
+    sfuVendor: flags.sfuVendor(),
     longPollEnabled: flags.longPollEnabled(),
   });
 });

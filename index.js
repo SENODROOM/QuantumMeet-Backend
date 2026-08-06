@@ -121,6 +121,15 @@ app.use("/api/secret", secretMeetRouter);
 const growthRouter = require("./growth");
 app.use("/api/growth", growthRouter);
 
+// ── LTI 1.3 stub ──────────────────────────────────────────────────────────────
+app.use("/api/lti", require("./lti"));
+
+// ── SFU stub ──────────────────────────────────────────────────────────────────
+app.use("/api/sfu", require("./sfu"));
+
+// ── Partner API keys ──────────────────────────────────────────────────────────
+app.use("/api/partner", require("./partnerApi"));
+
 // ── Cron (scheduled classroom posts) ──────────────────────────────────────────
 const cronRouter = require("./cron");
 app.use("/api/cron", cronRouter);
