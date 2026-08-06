@@ -3,12 +3,12 @@ const { v4: uuidv4 } = require("uuid");
 
 const { publishSecret, listSecretInbox } = require("./lib/events");
 const { SecretQueueEntry } = require("./models/realtime");
+const { secretJoinLimiter } = require("./lib/rateLimiters");
+const { audit } = require("./lib/audit");
 
 const router = express.Router();
 
-// Random-pairing queue. The waiting client polls GET /inbox; this endpoint
-// writes a SecretInbox row when someone else claims the queue entry.
-router.post("/join", async (req, res) => {
+router.post("/join", secretJoinLimiter, async (req, res) => {
   try {
     const { userId, userName } = req.body;
     await SecretQueueEntry.deleteMany({ userId }); // clear any stale entry (rejoin)
@@ -51,6 +51,21 @@ router.get("/inbox", async (req, res) => {
       events,
       serverTime: new Date().toISOString(),
     });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post("/report", async (req, res) => {
+  try {
+    const { userId, targetUserId, reason } = req.body;
+    await audit({
+      action: "secret-report",
+      actorId: userId || "anonymous",
+      targetId: targetUserId,
+      meta: { reason: (reason || "").slice(0, 500) },
+    });
+    res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

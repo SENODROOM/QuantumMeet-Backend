@@ -7,6 +7,8 @@ const roomSchema = new mongoose.Schema({
   hostName: { type: String, default: "Host" },
   isPublic: { type: Boolean, default: true },
   title: { type: String, default: "" },
+  classroomId: { type: String },
+  accountUserId: { type: String },
   participants: [String],
   participantCount: { type: Number, default: 0 },
 });

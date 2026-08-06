@@ -1181,6 +1181,41 @@ router.post("/:classroomId/attendance", async (req, res) => {
   }
 });
 
+/** Auto-mark present from live room presence (Y1 H2). */
+router.post("/:classroomId/attendance/from-presence", async (req, res) => {
+  try {
+    const { roomId, sessionId } = req.body;
+    const { listPresence } = require("./lib/events");
+    const members = await listPresence(roomId);
+    const records = members.map((m) => ({
+      studentId: m.userId,
+      studentName: m.userName,
+      status: "present",
+      joinTime: new Date(),
+    }));
+    const existing = await Attendance.findOne({
+      classroomId: req.params.classroomId,
+      sessionId,
+    });
+    if (existing) {
+      const byId = new Map(existing.records.map((r) => [r.studentId, r]));
+      for (const r of records) byId.set(r.studentId, r);
+      existing.records = [...byId.values()];
+      await existing.save();
+      return res.json(existing);
+    }
+    const a = await Attendance.create({
+      classroomId: req.params.classroomId,
+      sessionId: sessionId || uuidv4(),
+      date: new Date(),
+      records,
+    });
+    res.json(a);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ═════════════════════════════════════════════════════════════════════════════
 // SCHEDULED POSTS
 // ═════════════════════════════════════════════════════════════════════════════

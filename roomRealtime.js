@@ -5,6 +5,7 @@ const Room = require("./models/room");
 const {
   publish,
   listEvents,
+  listEventsWait,
   enterPresence,
   heartbeatPresence,
   leavePresence,
@@ -13,6 +14,14 @@ const {
   activePublicRoomIds,
   removeUserFromRoom,
 } = require("./lib/events");
+const { signRoomToken, isHostToken } = require("./lib/roomAuth");
+const {
+  eventsPostLimiter,
+  presenceLimiter,
+  chatLimiter,
+} = require("./lib/rateLimiters");
+const { audit } = require("./lib/audit");
+const flags = require("./lib/featureFlags");
 const {
   Message,
   Poll,
@@ -23,16 +32,20 @@ const {
 
 const router = express.Router();
 
-// Meeting rooms are intentionally login-free (see classroom.js for the
-// JWT-gated classroom surface) — identity here is whatever userId the
-// client generated for itself, same trust model the old socket.io server
-// used (roomHosts.get(roomId) === meta.userId, where meta.userId came from
-// the client's join-room payload, not a verified token).
-
-async function isHost(roomId, userId) {
-  if (!userId) return false;
-  const room = await Room.findOne({ roomId });
-  return !!room && room.host === userId;
+// Host actions require a host-scoped room JWT (issued at create / claim-host).
+async function requireHost(req, res) {
+  const roomId = req.params.roomId;
+  const userId = req.body?.userId || req.query?.userId;
+  const token =
+    req.body?.roomToken ||
+    req.query?.roomToken ||
+    (req.headers["x-room-token"] || "").toString() ||
+    (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+  if (!isHostToken(roomId, userId, token)) {
+    res.status(403).json({ error: "Host room token required" });
+    return false;
+  }
+  return true;
 }
 
 // ─── Rooms ────────────────────────────────────────────────────────────────
@@ -50,13 +63,19 @@ router.post("/", async (req, res) => {
         isPublic,
         title,
         participantCount: 0,
+        classroomId: req.body.classroomId || undefined,
+        accountUserId: req.body.accountUserId || undefined,
       });
     } catch (dbErr) {
       // DB unavailable — room still usable, just not persisted/discoverable
     }
+    const hostToken = userId
+      ? signRoomToken({ roomId, userId, role: "host" })
+      : null;
     res.json({
       roomId,
       isPublic,
+      hostToken,
       link: `${process.env.CLIENT_URL || "http://localhost:3000"}/room/${roomId}`,
     });
   } catch (err) {
@@ -98,6 +117,16 @@ router.get("/", async (req, res) => {
   }
 });
 
+// Mesh / SFU policy for clients (Y2 scale path)
+router.get("/config/realtime", (_req, res) => {
+  res.json({
+    meshSoftCap: flags.meshSoftCap(),
+    sfuThreshold: flags.sfuThreshold(),
+    sfuEnabled: flags.sfuEnabled(),
+    longPollEnabled: flags.longPollEnabled(),
+  });
+});
+
 router.get("/:roomId", async (req, res) => {
   try {
     const roomData = await Room.findOne({ roomId: req.params.roomId }).catch(
@@ -123,7 +152,7 @@ router.get("/:roomId", async (req, res) => {
 });
 
 // ─── Event bus (signaling + ephemeral fan-out) ────────────────────────────
-router.post("/:roomId/events", async (req, res) => {
+router.post("/:roomId/events", eventsPostLimiter, async (req, res) => {
   try {
     const { roomId } = req.params;
     const { event, payload = {}, from, to } = req.body;
@@ -145,9 +174,13 @@ router.post("/:roomId/events", async (req, res) => {
 
 router.get("/:roomId/events", async (req, res) => {
   try {
-    const { since, userId } = req.query;
+    const { since, userId, wait } = req.query;
     if (!userId) return res.status(400).json({ error: "userId required" });
-    const events = await listEvents(req.params.roomId, since, userId);
+    const waitMs =
+      flags.longPollEnabled() && wait != null ? Number(wait) : 0;
+    const events = waitMs
+      ? await listEventsWait(req.params.roomId, since, userId, waitMs)
+      : await listEvents(req.params.roomId, since, userId);
     res.json({
       events,
       serverTime: new Date().toISOString(),
@@ -157,8 +190,78 @@ router.get("/:roomId/events", async (req, res) => {
   }
 });
 
+// Issue / refresh tokens
+router.post("/:roomId/token", async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const { userId, roomToken } = req.body;
+    if (!userId) return res.status(400).json({ error: "userId required" });
+    if (isHostToken(roomId, userId, roomToken)) {
+      return res.json({
+        role: "host",
+        roomToken: signRoomToken({ roomId, userId, role: "host" }),
+      });
+    }
+    res.json({
+      role: "participant",
+      roomToken: signRoomToken({ roomId, userId, role: "participant" }),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Claim host with classroom/account JWT (identity bridge)
+router.post("/:roomId/claim-host", async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const { userId, accountUserId, userName } = req.body;
+    const authHeader = req.headers.authorization || "";
+    const jwtToken = authHeader.startsWith("Bearer ")
+      ? authHeader.slice(7)
+      : null;
+    if (!jwtToken || !accountUserId) {
+      return res.status(401).json({ error: "Account JWT required to claim host" });
+    }
+    const jwt = require("jsonwebtoken");
+    let claims;
+    try {
+      claims = jwt.verify(jwtToken, process.env.JWT_SECRET);
+    } catch {
+      return res.status(401).json({ error: "Invalid account token" });
+    }
+    if (claims.id !== accountUserId) {
+      return res.status(403).json({ error: "Token user mismatch" });
+    }
+    const room = await Room.findOne({ roomId });
+    if (!room) return res.status(404).json({ error: "Room not found" });
+    // Allow claim if already host userId, or room has no account binding, or matches
+    if (
+      room.accountUserId &&
+      room.accountUserId !== accountUserId &&
+      room.host !== userId
+    ) {
+      return res.status(403).json({ error: "Host already claimed by another account" });
+    }
+    room.host = userId;
+    room.hostName = userName || room.hostName;
+    room.accountUserId = accountUserId;
+    await room.save();
+    const hostToken = signRoomToken({ roomId, userId, role: "host" });
+    await audit({
+      action: "claim-host",
+      roomId,
+      actorId: accountUserId,
+      meta: { userId },
+    });
+    res.json({ hostToken, role: "host" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── Presence ─────────────────────────────────────────────────────────────
-router.post("/:roomId/presence", async (req, res) => {
+router.post("/:roomId/presence", presenceLimiter, async (req, res) => {
   try {
     const { roomId } = req.params;
     const { userId, userName, connectionId, heartbeat } = req.body;
@@ -232,7 +335,7 @@ router.post("/:roomId/knock", async (req, res) => {
 router.get("/:roomId/knocks", async (req, res) => {
   try {
     const { userId } = req.query;
-    if (!(await isHost(req.params.roomId, userId))) return res.json([]);
+    if (!(await requireHost(req, res))) return;
     res.json(await KnockRequest.find({ roomId: req.params.roomId }));
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -243,8 +346,7 @@ router.post("/:roomId/admit", async (req, res) => {
   try {
     const { roomId } = req.params;
     const { userId, targetUserId } = req.body;
-    if (!(await isHost(roomId, userId)))
-      return res.status(403).json({ error: "Not authorized" });
+    if (!(await requireHost(req, res))) return;
 
     await KnockRequest.deleteOne({ roomId, userId: targetUserId });
     await publish(roomId, "knock-accepted", { to: targetUserId }, { to: targetUserId });
@@ -258,8 +360,7 @@ router.post("/:roomId/reject", async (req, res) => {
   try {
     const { roomId } = req.params;
     const { userId, targetUserId } = req.body;
-    if (!(await isHost(roomId, userId)))
-      return res.status(403).json({ error: "Not authorized" });
+    if (!(await requireHost(req, res))) return;
 
     await KnockRequest.deleteOne({ roomId, userId: targetUserId });
     await publish(roomId, "knock-rejected", { to: targetUserId }, { to: targetUserId });
@@ -273,8 +374,7 @@ router.post("/:roomId/kick", async (req, res) => {
   try {
     const { roomId } = req.params;
     const { userId, targetUserId, targetUserName } = req.body;
-    if (!(await isHost(roomId, userId)))
-      return res.status(403).json({ error: "Not authorized" });
+    if (!(await requireHost(req, res))) return;
 
     await removeUserFromRoom(roomId, targetUserId);
     await publish(roomId, "kicked", { to: targetUserId }, { to: targetUserId });
@@ -302,8 +402,7 @@ router.post("/:roomId/host-action", async (req, res) => {
   try {
     const { roomId } = req.params;
     const { userId, action, targetUserId, allowed } = req.body;
-    if (!(await isHost(roomId, userId)))
-      return res.status(403).json({ error: "Not authorized" });
+    if (!(await requireHost(req, res))) return;
 
     if (action === "wb-permission") {
       await publish(
@@ -331,6 +430,12 @@ router.post("/:roomId/host-action", async (req, res) => {
     } else {
       return res.status(400).json({ error: "Unknown action" });
     }
+    await audit({
+      action: "host:" + action,
+      roomId,
+      actorId: userId,
+      targetId: targetUserId,
+    });
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -349,7 +454,7 @@ router.get("/:roomId/chat", async (req, res) => {
   }
 });
 
-router.post("/:roomId/chat", async (req, res) => {
+router.post("/:roomId/chat", chatLimiter, async (req, res) => {
   try {
     const { roomId } = req.params;
     const { message, userName, userId } = req.body;
@@ -391,8 +496,7 @@ router.post("/:roomId/polls", async (req, res) => {
   try {
     const { roomId } = req.params;
     const { userId, question, options, createdBy } = req.body;
-    if (!(await isHost(roomId, userId)))
-      return res.status(403).json({ error: "Not authorized" });
+    if (!(await requireHost(req, res))) return;
 
     const poll = await Poll.create({
       roomId,
@@ -433,8 +537,7 @@ router.post("/:roomId/polls/:pollId/end", async (req, res) => {
   try {
     const { roomId, pollId } = req.params;
     const { userId } = req.body;
-    if (!(await isHost(roomId, userId)))
-      return res.status(403).json({ error: "Not authorized" });
+    if (!(await requireHost(req, res))) return;
 
     const poll = await Poll.findById(pollId);
     if (!poll || poll.roomId !== roomId)
@@ -497,8 +600,7 @@ router.patch("/:roomId/qna/:qId/answered", async (req, res) => {
   try {
     const { roomId, qId } = req.params;
     const { userId } = req.body;
-    if (!(await isHost(roomId, userId)))
-      return res.status(403).json({ error: "Not authorized" });
+    if (!(await requireHost(req, res))) return;
     const q = await Question.findOne({ _id: qId, roomId });
     if (!q) return res.status(404).json({ error: "Not found" });
     q.answered = !q.answered;
@@ -514,8 +616,7 @@ router.patch("/:roomId/qna/:qId/pin", async (req, res) => {
   try {
     const { roomId, qId } = req.params;
     const { userId } = req.body;
-    if (!(await isHost(roomId, userId)))
-      return res.status(403).json({ error: "Not authorized" });
+    if (!(await requireHost(req, res))) return;
 
     await Question.updateMany({ roomId }, { pinned: false });
     const q = await Question.findOne({ _id: qId, roomId });
@@ -535,8 +636,7 @@ router.delete("/:roomId/qna/:qId", async (req, res) => {
   try {
     const { roomId, qId } = req.params;
     const { userId } = req.body;
-    if (!(await isHost(roomId, userId)))
-      return res.status(403).json({ error: "Not authorized" });
+    if (!(await requireHost(req, res))) return;
 
     await Question.deleteOne({ _id: qId, roomId });
     const all = await Question.find({ roomId }).sort({ createdAt: 1 });
@@ -560,8 +660,7 @@ router.post("/:roomId/breakout", async (req, res) => {
   try {
     const { roomId } = req.params;
     const { userId, breakoutRooms } = req.body;
-    if (!(await isHost(roomId, userId)))
-      return res.status(403).json({ error: "Not authorized" });
+    if (!(await requireHost(req, res))) return;
 
     const session = await BreakoutSession.findOneAndUpdate(
       { roomId },
@@ -579,8 +678,7 @@ router.post("/:roomId/breakout/assign", async (req, res) => {
   try {
     const { roomId } = req.params;
     const { userId, targetUserId, breakoutRoomId } = req.body;
-    if (!(await isHost(roomId, userId)))
-      return res.status(403).json({ error: "Not authorized" });
+    if (!(await requireHost(req, res))) return;
 
     await publish(
       roomId,
@@ -598,8 +696,7 @@ router.delete("/:roomId/breakout", async (req, res) => {
   try {
     const { roomId } = req.params;
     const { userId } = req.body;
-    if (!(await isHost(roomId, userId)))
-      return res.status(403).json({ error: "Not authorized" });
+    if (!(await requireHost(req, res))) return;
 
     await BreakoutSession.deleteOne({ roomId });
     await publish(roomId, "breakout-ended", {});
@@ -613,8 +710,7 @@ router.post("/:roomId/breakout/broadcast", async (req, res) => {
   try {
     const { roomId } = req.params;
     const { userId, message } = req.body;
-    if (!(await isHost(roomId, userId)))
-      return res.status(403).json({ error: "Not authorized" });
+    if (!(await requireHost(req, res))) return;
 
     await publish(roomId, "breakout-broadcast-msg", {
       message,
@@ -630,10 +726,53 @@ router.post("/:roomId/breakout/callback", async (req, res) => {
   try {
     const { roomId } = req.params;
     const { userId } = req.body;
-    if (!(await isHost(roomId, userId)))
-      return res.status(403).json({ error: "Not authorized" });
+    if (!(await requireHost(req, res))) return;
 
     await publish(roomId, "breakout-callback", {});
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** GDPR-style purge of room ephemeral data (Y2 compliance). */
+router.delete("/:roomId/retention", async (req, res) => {
+  try {
+    if (!(await requireHost(req, res))) return;
+    const { roomId } = req.params;
+    const { RoomEvent, Message, KnockRequest, Presence } = require("./models/realtime");
+    await Promise.all([
+      RoomEvent.deleteMany({ roomId }),
+      Message.deleteMany({ roomId }),
+      KnockRequest.deleteMany({ roomId }),
+      Presence.deleteMany({ roomId }),
+    ]);
+    await audit({
+      action: "retention-purge",
+      roomId,
+      actorId: req.body.userId,
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Recording upload: client records locally then uploads to Blob via classroom
+ * blob-upload token when classroomId is set. This endpoint only logs metadata.
+ */
+router.post("/:roomId/recordings", async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const { userId, blobUrl, durationSec, classroomId } = req.body;
+    await audit({
+      action: "recording-saved",
+      roomId,
+      classroomId,
+      actorId: userId,
+      meta: { blobUrl, durationSec },
+    });
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });

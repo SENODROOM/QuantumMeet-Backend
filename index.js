@@ -5,6 +5,16 @@ const helmet = require("helmet");
 
 const { connectDB } = require("./lib/db");
 
+// Optional Sentry (set SENTRY_DSN)
+if (process.env.SENTRY_DSN) {
+  try {
+    const Sentry = require("@sentry/node");
+    Sentry.init({ dsn: process.env.SENTRY_DSN, tracesSampleRate: 0.1 });
+  } catch (err) {
+    console.warn("Sentry init skipped:", err.message);
+  }
+}
+
 const app = express();
 
 const allowedOrigins = [
@@ -79,9 +89,24 @@ app.use("/api/rooms", roomRealtimeRouter);
 const secretMeetRouter = require("./secretMeet");
 app.use("/api/secret", secretMeetRouter);
 
+// ── Growth APIs (scheduling, orgs, webhooks) ──────────────────────────────────
+const growthRouter = require("./growth");
+app.use("/api/growth", growthRouter);
+
+// ── Cron (scheduled classroom posts) ──────────────────────────────────────────
+const cronRouter = require("./cron");
+app.use("/api/cron", cronRouter);
+
 // Health check
 app.get("/api/health", (_, res) =>
-  res.json({ status: "ok", time: new Date() }),
+  res.json({
+    status: "ok",
+    time: new Date(),
+    features: {
+      longPoll: require("./lib/featureFlags").longPollEnabled(),
+      sfu: require("./lib/featureFlags").sfuEnabled(),
+    },
+  }),
 );
 
 // ─── Start (local dev only — Vercel imports `app` as the request handler) ────

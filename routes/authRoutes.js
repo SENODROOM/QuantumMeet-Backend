@@ -3,7 +3,7 @@ const express = require("express");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
-const rateLimit = require("express-rate-limit");
+const { loginLimiter } = require("../lib/rateLimiters");
 
 const router = express.Router();
 
@@ -40,15 +40,6 @@ const safeUser = (user) => ({
   id: user._id.toString(),
   name: user.name,
   email: user.email,
-});
-
-// ── Rate limit — login only (brute force protection) ─────────────────────────
-const loginLimit = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 10,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: "Too many login attempts. Try again in 15 minutes." },
 });
 
 // ── POST /api/auth/register ───────────────────────────────────────────────────
@@ -89,7 +80,7 @@ router.post("/register", async (req, res) => {
 });
 
 // ── POST /api/auth/login ──────────────────────────────────────────────────────
-router.post("/login", loginLimit, async (req, res) => {
+router.post("/login", loginLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
 
