@@ -69,6 +69,8 @@ const roomEventSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now, expires: 300, index: true },
 });
 roomEventSchema.index({ roomId: 1, createdAt: 1 });
+roomEventSchema.index({ roomId: 1, createdAt: 1, to: 1 });
+roomEventSchema.index({ roomId: 1, from: 1, createdAt: 1 });
 
 const secretInboxSchema = new mongoose.Schema({
   userId: { type: String, required: true, index: true },
@@ -85,6 +87,7 @@ const presenceSchema = new mongoose.Schema({
   lastSeen: { type: Date, default: Date.now, index: true },
 });
 presenceSchema.index({ roomId: 1, userId: 1, connectionId: 1 }, { unique: true });
+presenceSchema.index({ roomId: 1, lastSeen: 1 });
 
 function model(name, schema) {
   try {

@@ -14,7 +14,7 @@ const {
   activePublicRoomIds,
   removeUserFromRoom,
 } = require("./lib/events");
-const { signRoomToken, isHostToken } = require("./lib/roomAuth");
+const { signRoomToken, isHostTokenAsync, rotateHostToken, revokeToken } = require("./lib/roomAuth");
 const {
   eventsPostLimiter,
   presenceLimiter,
@@ -41,7 +41,7 @@ async function requireHost(req, res) {
     req.query?.roomToken ||
     (req.headers["x-room-token"] || "").toString() ||
     (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
-  if (!isHostToken(roomId, userId, token)) {
+  if (!(await isHostTokenAsync(roomId, userId, token))) {
     res.status(403).json({ error: "Host room token required" });
     return false;
   }
@@ -67,7 +67,11 @@ router.post("/", async (req, res) => {
         accountUserId: req.body.accountUserId || undefined,
       });
     } catch (dbErr) {
-      // DB unavailable — room still usable, just not persisted/discoverable
+      return res.status(503).json({
+        error: "Failed to persist room",
+        code: "DB_UNAVAILABLE",
+        detail: dbErr.message,
+      });
     }
     const hostToken = userId
       ? signRoomToken({ roomId, userId, role: "host" })
@@ -196,7 +200,7 @@ router.post("/:roomId/token", async (req, res) => {
     const { roomId } = req.params;
     const { userId, roomToken } = req.body;
     if (!userId) return res.status(400).json({ error: "userId required" });
-    if (isHostToken(roomId, userId, roomToken)) {
+    if (await isHostTokenAsync(roomId, userId, roomToken)) {
       return res.json({
         role: "host",
         roomToken: signRoomToken({ roomId, userId, role: "host" }),
@@ -206,6 +210,41 @@ router.post("/:roomId/token", async (req, res) => {
       role: "participant",
       roomToken: signRoomToken({ roomId, userId, role: "participant" }),
     });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** E-103: rotate host token (revokes previous jti). */
+router.post("/:roomId/token/rotate", async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const { userId, roomToken } = req.body;
+    const result = await rotateHostToken({
+      roomId,
+      userId,
+      oldToken: roomToken,
+    });
+    if (!result.ok) return res.status(403).json({ error: result.error });
+    res.json({ role: "host", roomToken: result.roomToken, jti: result.jti });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** E-103: revoke a room token (host or self). */
+router.post("/:roomId/token/revoke", async (req, res) => {
+  try {
+    const { roomToken } = req.body;
+    const result = await revokeToken(roomToken, "explicit");
+    if (!result.ok) return res.status(400).json({ error: result.error });
+    await audit({
+      action: "token-revoke",
+      roomId: req.params.roomId,
+      actorId: req.body.userId || "unknown",
+      meta: { jti: result.jti },
+    });
+    res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

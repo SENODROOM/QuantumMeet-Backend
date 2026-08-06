@@ -4,6 +4,7 @@ const cors = require("cors");
 const helmet = require("helmet");
 
 const { connectDB } = require("./lib/db");
+const { isDbReady } = require("./lib/requireDb");
 
 // Optional Sentry (set SENTRY_DSN)
 if (process.env.SENTRY_DSN) {
@@ -62,13 +63,29 @@ app.options("*", cors());
 
 app.use(express.json());
 
-// ── DB connection (cached across warm serverless invocations) ────────────────
+// ── DB connection (E-111: fail closed for stateful APIs) ──────────────────────
+const DB_REQUIRED_PREFIXES = [
+  "/api/rooms",
+  "/api/secret",
+  "/api/classrooms",
+  "/api/auth",
+  "/api/growth",
+  "/api/cron",
+];
+
 app.use(async (req, res, next) => {
   try {
     await connectDB();
     next();
   } catch (err) {
     console.warn("⚠️  DB unavailable:", err.message);
+    const needsDb = DB_REQUIRED_PREFIXES.some((p) => req.path.startsWith(p));
+    if (needsDb) {
+      return res.status(503).json({
+        error: "Database unavailable",
+        code: "DB_UNAVAILABLE",
+      });
+    }
     next();
   }
 });
@@ -97,17 +114,25 @@ app.use("/api/growth", growthRouter);
 const cronRouter = require("./cron");
 app.use("/api/cron", cronRouter);
 
-// Health check
-app.get("/api/health", (_, res) =>
-  res.json({
-    status: "ok",
+// Health check — reports DB state (never fail-closed; used by probes)
+app.get("/api/health", async (_req, res) => {
+  let db = "disconnected";
+  try {
+    if (!isDbReady()) await connectDB();
+    db = isDbReady() ? "connected" : "disconnected";
+  } catch {
+    db = "disconnected";
+  }
+  res.status(db === "connected" ? 200 : 503).json({
+    status: db === "connected" ? "ok" : "degraded",
+    db,
     time: new Date(),
     features: {
       longPoll: require("./lib/featureFlags").longPollEnabled(),
       sfu: require("./lib/featureFlags").sfuEnabled(),
     },
-  }),
-);
+  });
+});
 
 // ─── Start (local dev only — Vercel imports `app` as the request handler) ────
 if (require.main === module) {
@@ -118,10 +143,8 @@ if (require.main === module) {
       app.listen(PORT, () => console.log(`🚀 Server on http://localhost:${PORT}`));
     })
     .catch((err) => {
-      console.warn("⚠️  No DB, running without persistence:", err.message);
-      app.listen(PORT, () =>
-        console.log(`🚀 Server on http://localhost:${PORT} (no DB)`),
-      );
+      console.error("❌ MongoDB required for meetings — refusing to start:", err.message);
+      process.exit(1);
     });
 }
 
