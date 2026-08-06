@@ -10,12 +10,11 @@ const router = express.Router();
 router.get("/features", (_req, res) => {
   res.json({
     meshSoftCap: flags.meshSoftCap(),
-    sfuThreshold: flags.sfuThreshold(),
-    sfuEnabled: flags.sfuEnabled(),
-    sfuVendor: flags.sfuVendor(),
     longPollEnabled: flags.longPollEnabled(),
     orgsEnabled: flags.orgsEnabled(),
     ssoEnabled: flags.ssoEnabled(),
+    mediaPolicy: "mesh_only",
+    deploy: "vercel-serverless",
   });
 });
 

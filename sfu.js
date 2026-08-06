@@ -1,35 +1,43 @@
 /**
- * SFU token stub (E-304/E-501 light). Returns 501 until vendor wired.
+ * Realtime media policy endpoint.
+ * QuantumMeet on Vercel = WebRTC mesh + Mongo HTTP signaling only.
+ * No hosted SFU (LiveKit/etc.) — those are paid/external and not part of this deploy.
  */
 const express = require("express");
 const flags = require("./lib/featureFlags");
 
 const router = express.Router();
 
-router.get("/token", (req, res) => {
-  if (!flags.sfuEnabled()) {
-    return res.status(503).json({
-      error: "SFU disabled",
-      code: "SFU_DISABLED",
-      vendor: process.env.SFU_VENDOR || null,
-    });
-  }
-  const vendor = process.env.SFU_VENDOR || "unset";
+router.get("/token", (_req, res) => {
   res.status(501).json({
-    error: "SFU token mint not implemented",
-    code: "SFU_TOKEN_PENDING",
-    vendor,
-    roomId: req.query.roomId || null,
-    hint: "Complete E-304 spike then wire LiveKit/mediasoup JWT here",
+    error: "No SFU on this deployment",
+    code: "SFU_NOT_USED",
+    policy: "mesh_only",
+    hint: "Media is WebRTC P2P mesh; signaling is Mongo/HTTP on Vercel serverless.",
   });
 });
 
 router.get("/health", (_req, res) => {
   res.json({
-    enabled: flags.sfuEnabled(),
-    vendor: process.env.SFU_VENDOR || null,
-    threshold: flags.sfuThreshold(),
+    policy: "mesh_only",
+    enabled: false,
+    vendor: null,
+    configured: false,
     meshSoftCap: flags.meshSoftCap(),
+    sfuThreshold: flags.sfuThreshold(),
+    note: "Vercel deploy stays mesh WebRTC + serverless API — no hosted SFU.",
+  });
+});
+
+router.get("/deploy-check", (_req, res) => {
+  res.json({
+    ok: true,
+    policy: "mesh_only",
+    checks: {
+      serverlessApi: true,
+      meshWebRtc: true,
+      hostedSfu: false,
+    },
   });
 });
 

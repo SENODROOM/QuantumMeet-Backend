@@ -20,8 +20,10 @@ const app = express();
 const log = require("./lib/log");
 const { requestIdMiddleware } = require("./lib/requestId");
 const { getIceConfig } = require("./lib/ice");
+const { regionMiddleware, regionSnapshot } = require("./lib/region");
 
 app.use(requestIdMiddleware);
+app.use(regionMiddleware);
 
 const allowedOrigins = [
   "https://meet.quantumlogicslimited.com",
@@ -153,16 +155,19 @@ app.get("/api/health", async (req, res) => {
     db = "disconnected";
   }
   const ice = getIceConfig();
+  const region = regionSnapshot();
   res.status(db === "connected" ? 200 : 503).json({
     status: db === "connected" ? "ok" : "degraded",
     db,
     time: new Date(),
     requestId: req.requestId,
+    region,
     ice: { hasTurn: ice.hasTurn },
     metrics: require("./lib/metrics").snapshot(),
     features: {
       longPoll: require("./lib/featureFlags").longPollEnabled(),
-      sfu: require("./lib/featureFlags").sfuEnabled(),
+      media: "mesh",
+      deploy: "vercel-serverless",
     },
   });
 });

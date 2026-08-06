@@ -19,13 +19,16 @@ async function check(path) {
 async function main() {
   const health = await check("/api/health");
   const ice = await check("/api/ice");
+  const media = await check("/api/sfu/health");
   const ok =
     health.status === 200 &&
     health.body?.status === "ok" &&
     ice.status === 200 &&
-    Array.isArray(ice.body?.iceServers);
+    Array.isArray(ice.body?.iceServers) &&
+    media.status === 200 &&
+    media.body?.policy === "mesh_only";
 
-  console.log(JSON.stringify({ ok, health, ice }, null, 2));
+  console.log(JSON.stringify({ ok, region: health.body?.region, health, ice, media }, null, 2));
   if (!ok) process.exit(1);
 }
 

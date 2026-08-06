@@ -125,10 +125,9 @@ router.get("/", async (req, res) => {
 router.get("/config/realtime", (_req, res) => {
   res.json({
     meshSoftCap: flags.meshSoftCap(),
-    sfuThreshold: flags.sfuThreshold(),
-    sfuEnabled: flags.sfuEnabled(),
-    sfuVendor: flags.sfuVendor(),
     longPollEnabled: flags.longPollEnabled(),
+    mediaPolicy: "mesh_only",
+    deploy: "vercel-serverless",
   });
 });
 
