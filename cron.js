@@ -21,18 +21,28 @@ function authorizeCron(req, res, next) {
 
 router.get("/scheduled-posts", authorizeCron, async (_req, res) => {
   try {
+    const metrics = require("./lib/metrics");
+    metrics.inc("cronRuns");
     const result = await publishDueScheduledPosts();
+    if (result.count) metrics.inc("cronPublished", result.count);
+    require("./lib/log").info("cron_scheduled_posts", { count: result.count });
     res.json({ ok: true, ...result, at: new Date().toISOString() });
   } catch (err) {
+    require("./lib/log").error("cron_scheduled_posts_failed", { err: err.message });
     res.status(500).json({ error: err.message });
   }
 });
 
 router.post("/scheduled-posts", authorizeCron, async (_req, res) => {
   try {
+    const metrics = require("./lib/metrics");
+    metrics.inc("cronRuns");
     const result = await publishDueScheduledPosts();
+    if (result.count) metrics.inc("cronPublished", result.count);
+    require("./lib/log").info("cron_scheduled_posts", { count: result.count });
     res.json({ ok: true, ...result, at: new Date().toISOString() });
   } catch (err) {
+    require("./lib/log").error("cron_scheduled_posts_failed", { err: err.message });
     res.status(500).json({ error: err.message });
   }
 });

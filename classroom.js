@@ -369,6 +369,17 @@ router.post("/join", validate(schemas.joinClassroom), async (req, res) => {
     if (!doc.members.find((m) => m.userId === userId)) {
       doc.members.push({ userId, userName, role: "student" });
       await doc.save();
+      try {
+        const { audit } = require("./lib/audit");
+        await audit({
+          action: "classroom-join",
+          classroomId: doc.classroomId,
+          actorId: userId,
+          meta: { inviteCode: inviteCode.toUpperCase(), userName },
+        });
+      } catch {
+        /* non-fatal */
+      }
     }
     res.json(doc);
   } catch (e) {
@@ -816,6 +827,7 @@ router.post("/:classroomId/posts/:postId/submissions", async (req, res) => {
     if (parsedAnswers) {
       const post = await Post.findOne({ postId: req.params.postId });
       if (post?.quizQuestions?.length) {
+        // Server-authoritative grading — ignore client quizScore/grade
         let correct = 0;
         parsedAnswers.forEach((ans, i) => {
           if (ans === post.quizQuestions[i]?.correct) correct++;

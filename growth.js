@@ -90,6 +90,66 @@ router.get("/orgs", async (req, res) => {
   }
 });
 
+router.post("/orgs/:orgId/invite", async (req, res) => {
+  if (!flags.orgsEnabled()) {
+    return res.status(503).json({ error: "Orgs feature flag disabled" });
+  }
+  try {
+    const org = await Org.findOne({ orgId: req.params.orgId });
+    if (!org) return res.status(404).json({ error: "Org not found" });
+    const me = org.members.find((m) => m.userId === req.user.id);
+    if (!me || !["owner", "admin"].includes(me.role)) {
+      return res.status(403).json({ error: "Not authorized" });
+    }
+    const { userId, role } = req.body;
+    if (!userId) return res.status(400).json({ error: "userId required" });
+    const existing = org.members.find((m) => m.userId === userId);
+    if (existing) {
+      existing.role = role || existing.role;
+    } else {
+      if (org.members.length >= (org.seatLimit || 50)) {
+        return res.status(403).json({ error: "Seat limit reached" });
+      }
+      org.members.push({ userId, role: role || "member" });
+    }
+    await org.save();
+    try {
+      const { audit } = require("./lib/audit");
+      await audit({
+        action: "org-invite",
+        actorId: req.user.id,
+        meta: { orgId: org.orgId, userId, role: role || "member" },
+      });
+    } catch {
+      /* ignore */
+    }
+    res.json(org);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.patch("/orgs/:orgId/members/:memberId/role", async (req, res) => {
+  if (!flags.orgsEnabled()) {
+    return res.status(503).json({ error: "Orgs feature flag disabled" });
+  }
+  try {
+    const org = await Org.findOne({ orgId: req.params.orgId });
+    if (!org) return res.status(404).json({ error: "Org not found" });
+    const me = org.members.find((m) => m.userId === req.user.id);
+    if (!me || me.role !== "owner") {
+      return res.status(403).json({ error: "Owner only" });
+    }
+    const m = org.members.find((x) => x.userId === req.params.memberId);
+    if (!m) return res.status(404).json({ error: "Member not found" });
+    m.role = req.body.role || m.role;
+    await org.save();
+    res.json(org);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Webhooks ──────────────────────────────────────────────────────────────────
 router.post("/webhooks", async (req, res) => {
   try {
