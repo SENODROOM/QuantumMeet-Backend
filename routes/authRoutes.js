@@ -118,4 +118,69 @@ router.get("/me", require("../middleware/auth"), async (req, res) => {
   }
 });
 
+// ── GET /api/auth/me/export — self-serve data export (E-403) ─────────────────
+router.get("/me/export", require("../middleware/auth"), async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id).select("-password");
+    if (!user) return res.status(404).json({ error: "User not found" });
+    let orgs = [];
+    try {
+      const { Org } = require("../models/growth");
+      orgs = await Org.find({ "members.userId": req.user.id })
+        .select("orgId name role members seatLimit createdAt")
+        .lean();
+    } catch {
+      /* ignore */
+    }
+    let classrooms = [];
+    try {
+      const Classroom = mongoose.model("Classroom");
+      classrooms = await Classroom.find({ "members.userId": req.user.id })
+        .select("classroomId name inviteCode members role")
+        .lean();
+    } catch {
+      /* model may not be registered yet */
+    }
+    res.json({
+      exportedAt: new Date().toISOString(),
+      user: safeUser(user),
+      orgs,
+      classrooms,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── DELETE /api/auth/me — account delete (E-403) ─────────────────────────────
+router.delete("/me", require("../middleware/auth"), async (req, res) => {
+  try {
+    const uid = req.user.id;
+    try {
+      const { Org } = require("../models/growth");
+      const orgs = await Org.find({ "members.userId": uid });
+      for (const org of orgs) {
+        if (org.ownerId === uid) {
+          await Org.deleteOne({ orgId: org.orgId });
+        } else {
+          org.members = org.members.filter((m) => m.userId !== uid);
+          await org.save();
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    await User.deleteOne({ _id: uid });
+    try {
+      const { audit } = require("../lib/audit");
+      await audit({ action: "account-deleted", actorId: uid });
+    } catch {
+      /* ignore */
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;

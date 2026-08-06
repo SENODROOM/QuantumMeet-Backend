@@ -150,6 +150,40 @@ router.patch("/orgs/:orgId/members/:memberId/role", async (req, res) => {
   }
 });
 
+router.patch("/orgs/:orgId", async (req, res) => {
+  if (!flags.orgsEnabled()) {
+    return res.status(503).json({ error: "Orgs feature flag disabled" });
+  }
+  try {
+    const org = await Org.findOne({ orgId: req.params.orgId });
+    if (!org) return res.status(404).json({ error: "Org not found" });
+    const me = org.members.find((m) => m.userId === req.user.id);
+    if (!me || !["owner", "admin"].includes(me.role)) {
+      return res.status(403).json({ error: "Not authorized" });
+    }
+    if (req.body.name != null) org.name = String(req.body.name).slice(0, 120);
+    if (req.body.seatLimit != null) {
+      const n = Number(req.body.seatLimit);
+      if (!Number.isFinite(n) || n < 1) {
+        return res.status(400).json({ error: "Invalid seatLimit" });
+      }
+      if (n < (org.members?.length || 0)) {
+        return res.status(400).json({
+          error: "seatLimit cannot be below current member count",
+        });
+      }
+      org.seatLimit = n;
+    }
+    if (req.body.featureFlags && typeof req.body.featureFlags === "object") {
+      org.featureFlags = { ...(org.featureFlags || {}), ...req.body.featureFlags };
+    }
+    await org.save();
+    res.json(org);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Webhooks ──────────────────────────────────────────────────────────────────
 router.post("/webhooks", async (req, res) => {
   try {
